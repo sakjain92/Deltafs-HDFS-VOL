@@ -51,6 +51,7 @@
 
 /* Includes needed to set as default VOL driver */
 #include "H5VLnative.h" 	/* Native H5 VOL plugin	*/
+#include "H5VLdeltafs.h"
 
 #ifdef H5_HAVE_WINDOWS
 #include "H5FDwindows.h"        /* Windows buffered I/O                 */
@@ -340,11 +341,16 @@ static herr_t
 H5P__facc_reg_prop(H5P_genclass_t *pclass)
 {
     const H5FD_driver_prop_t def_driver_prop = H5F_ACS_FILE_DRV_DEF;           /* Default VFL driver ID & info (initialized from a variable) */
-    const H5VL_plugin_prop_t def_vol_prop = H5F_ACS_VOL_DEF;    /* Default VOL plugin ID & info (initialized from a variable) */
+    H5VL_plugin_prop_t def_vol_prop = H5F_ACS_VOL_DEF;    /* Default VOL plugin ID & info (initialized from a variable) */
 
     herr_t ret_value = SUCCEED;         /* Return value */
 
     FUNC_ENTER_STATIC
+
+    /* If deltafs is enabled, then set default VOL to deltafs */
+    if (H5VL_deltafs_is_enabled()) {
+        H5VL_deltafs_set_plugin_prop(&def_vol_prop);        
+    }
 
     /* Register the initial metadata cache resize configuration */
     if(H5P_register_real(pclass, H5F_ACS_META_CACHE_INIT_CONFIG_NAME, H5F_ACS_META_CACHE_INIT_CONFIG_SIZE, &H5F_def_mdc_initCacheCfg_g, 
@@ -3703,8 +3709,8 @@ H5P__facc_cache_config_enc(const void *value, void **_pp, size_t *size)
     *size += 1 + H5VM_limit_enc_size(enc_value);
 
     /* Compute encoded size of fixed-size values */
-    *size += (5 + (sizeof(unsigned) * 8) + (sizeof(double) * 8) +
-            (sizeof(int32_t) * 4) + sizeof(int64_t) +
+    *size += (5 + (sizeof(unsigned) * 8) + (sizeof(double) * 8) + 
+            (sizeof(int32_t) * 4) + sizeof(int64_t) + 
             H5AC__MAX_TRACE_FILE_NAME_LEN + 1);
 
     FUNC_LEAVE_NOAPI(SUCCEED)
