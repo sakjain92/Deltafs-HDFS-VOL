@@ -66,6 +66,9 @@ static herr_t H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id,
 static herr_t H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id,
     hid_t mem_space_id, hid_t file_space_id, hid_t dxpl_id, const void *buf,
     void **req);
+static herr_t
+H5VL_deltafs_dataset_get(void *_dset, H5VL_dataset_get_t get_type, 
+    hid_t dxpl_id, void **req, va_list arguments);
 static herr_t H5VL_deltafs_dataset_close(void *_dset, hid_t dxpl_id, void **req);
 
 /* File callbacks */
@@ -126,7 +129,7 @@ static H5VL_class_t H5VL_deltafs_g = {
         H5VL_deltafs_dataset_open,              /* open */
         H5VL_deltafs_dataset_read,              /* read */
         H5VL_deltafs_dataset_write,             /* write */
-        NULL,                                   /* get */
+        H5VL_deltafs_dataset_get,               /* get */
         NULL,                                   /* specific */
         NULL,                                   /* optional */
         H5VL_deltafs_dataset_close              /* close */
@@ -518,7 +521,7 @@ H5VL_deltafs_file_close_helper(H5VL_deltafs_file_t *file)
     char *buf = NULL;
     size_t buf_size = 0, buf_offset = 0;
     size_t prev_end_offset = (size_t)-1;
-    int ret;
+    ssize_t ret;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -535,7 +538,7 @@ H5VL_deltafs_file_close_helper(H5VL_deltafs_file_t *file)
         if (NULL == (dset = H5VL_DELTAFS_LGET_FRONT(file->dlist_head)) ||
                 dset->dmd->offset != sizeof(file->fmd)) {
             if ((ret = deltafs_pwrite(file->fd, &file->fmd, sizeof(file->fmd), 0)) != sizeof(file->fmd))
-                HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't write file:%d, size: %ld, ret: %d, errno: %d", file->fd, sizeof(file->fmd), ret, errno)
+                HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't write file:%d, size: %ld, ret: %ld, errno: %d", file->fd, sizeof(file->fmd), ret, errno)
             file->dirty = false;
         } else {
             buf_size += sizeof(file->fmd);
@@ -573,7 +576,8 @@ H5VL_deltafs_file_close_helper(H5VL_deltafs_file_t *file)
     H5VL_DELTAFS_LFOR_EACH(file->dlist_head, dset) {
         if (dset->dirty == false)
             continue;
-        HDmemcpy(&buf[buf_offset], &dset->buf, dset->buf_size);
+        HDmemcpy(&buf[buf_offset], dset->buf, dset->buf_size);
+	
         buf_offset += dset->buf_size;
         assert(buf_offset <= buf_size);
     }
@@ -850,7 +854,7 @@ done:
  */
 static void *
 H5VL_deltafs_group_open(void *_item, H5VL_loc_params_t loc_params,
-    const char *name, hid_t gapl_id, hid_t H5_ATTR_UNUSED dxpl_id,
+    const char *name, hid_t H5_ATTR_UNUSED gapl_id, hid_t H5_ATTR_UNUSED dxpl_id,
     void H5_ATTR_UNUSED **req)
 {
     H5VL_deltafs_item_t *item = (H5VL_deltafs_item_t *)_item;
@@ -863,8 +867,8 @@ H5VL_deltafs_group_open(void *_item, H5VL_loc_params_t loc_params,
     if (H5VL_OBJECT_BY_ADDR == loc_params.type)
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "unsupported location parameter")
 
-    if (gapl_id != H5P_DEFAULT /*|| dxpl_id != H5P_DEFAULT */)
-        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported creation/transfer properties")
+    //if (gapl_id != H5P_DEFAULT /*|| dxpl_id != H5P_DEFAULT */)
+    //    HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported creation/transfer properties")
 
     /* Open using name parameter */
     if(H5VL_deltafs_get_group_index(item, name, &gidx) < 0)
@@ -1311,7 +1315,8 @@ done:
 static void *
 H5VL_deltafs_dataset_open(void *_item,
     H5VL_loc_params_t loc_params, const char *name,
-    hid_t dapl_id, hid_t H5_ATTR_UNUSED dxpl_id, void H5_ATTR_UNUSED **req)
+    hid_t H5_ATTR_UNUSED dapl_id, hid_t H5_ATTR_UNUSED dxpl_id,
+    void H5_ATTR_UNUSED **req)
 {
     H5VL_deltafs_item_t *item = (H5VL_deltafs_item_t *)_item;
     H5VL_deltafs_file_t *file = item->file;
@@ -1325,12 +1330,14 @@ H5VL_deltafs_dataset_open(void *_item,
     if (H5VL_OBJECT_BY_ADDR == loc_params.type)
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "unsupported location parameter")
 
-    if (dapl_id != H5P_DEFAULT /*|| dxpl_id != H5P_DEFAULT*/)
-        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported access/transfer properties")
+    //if (dapl_id != H5P_DEFAULT /*|| dxpl_id != H5P_DEFAULT*/)
+    //    HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported access/transfer properties")
 
     if (H5VL_deltafs_get_dataset_index(item, name, &didx, &gidx, false) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, NULL, "dataset name invalid")
 
+    dmd = &file->fmd.gmd[gidx].dmd[didx];
+    
     /* Allocate the dataset object that is returned to the user */
     if(NULL == (dset = H5FL_CALLOC(H5VL_deltafs_dset_t)))
         HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, NULL, "can't allocate Deltafs dataset struct")
@@ -1345,17 +1352,17 @@ H5VL_deltafs_dataset_open(void *_item,
     dset->buf_size = dmd->size;
     dset->is_buf_read = false;
     dset->rc = 1;
-    dset->dmd = &file->fmd.gmd[gidx].dmd[didx];
+    dset->dmd = dmd;
     H5VL_DELTAFS_LELEM_INIT(dset);
 
-    if (dset->dmd->type_size + dset->dmd->space_size > dset->dmd->size)
+    if (dmd->type_size + dmd->space_size > dmd->size)
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "corrupted file")
 
     /* TODO: If the dset is present in dlist in file, use that */
     if(NULL == (dset->buf = (char *)H5MM_malloc(dset->buf_size)))
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, NULL, "can't allocate space for buffer")
 
-    if (deltafs_pread(file->fd, &dset->buf, dset->buf_size, (int)dset->dmd->offset) != (int)dset->buf_size)
+    if (deltafs_pread(file->fd, dset->buf, dset->buf_size, (int)dmd->offset) != (int)dset->buf_size)
         HGOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "can't read file")
 
     dset->is_buf_read = true;
@@ -1363,7 +1370,7 @@ H5VL_deltafs_dataset_open(void *_item,
     /* Decode datatype and space id */
     if((dset->type_id = H5Tdecode(&dset->buf[0])) < 0)
         HGOTO_ERROR(H5E_ARGS, H5E_CANTDECODE, NULL, "can't deserialize datatype")
-    if((dset->space_id = H5Pdecode(&dset->buf[dset->dmd->type_size])) < 0)
+    if((dset->space_id = H5Sdecode(&dset->buf[dmd->type_size])) < 0)
         HGOTO_ERROR(H5E_ARGS, H5E_CANTDECODE, NULL, "can't deserialize dataspace")
     if(H5Sselect_all(dset->space_id) < 0)
         HGOTO_ERROR(H5E_DATASPACE, H5E_CANTDELETE, NULL, "can't change selection")
@@ -1552,7 +1559,7 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
 
     if (dset->is_buf_read == false) {
    
-        if (deltafs_pread(file->fd, &dset->buf, dset->buf_size, (int)dset->dmd->offset) != (int)dset->buf_size)
+        if (deltafs_pread(file->fd, dset->buf, dset->buf_size, (int)dset->dmd->offset) != (int)dset->buf_size)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't read file")
 
         dset->is_buf_read = false;
@@ -1640,6 +1647,68 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
 done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5VL_deltafs_dataset_write() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_dataset_get
+ *
+ * Purpose:     Gets certain information about a dataset
+ *
+ * Return:      Success:        0
+ *              Failure:        -1
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2017
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_dataset_get(void *_dset, H5VL_dataset_get_t get_type, 
+    hid_t H5_ATTR_UNUSED dxpl_id, void H5_ATTR_UNUSED **req, va_list arguments)
+{
+    H5VL_deltafs_dset_t *dset = (H5VL_deltafs_dset_t *)_dset;
+    herr_t ret_value = SUCCEED;    /* Return value */
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    switch (get_type) {
+        case H5VL_DATASET_GET_SPACE:
+            {
+                hid_t *ret_id = va_arg(arguments, hid_t *);
+
+                /* Retrieve the dataset's dataspace */
+                if((*ret_id = H5Scopy(dset->space_id)) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get dataspace ID of dataset");
+                break;
+            } /* end block */
+        case H5VL_DATASET_GET_SPACE_STATUS:
+            {
+                H5D_space_status_t *allocation = va_arg(arguments, H5D_space_status_t *);
+
+                /* Retrieve the dataset's space status */
+                *allocation = H5D_SPACE_STATUS_NOT_ALLOCATED;
+                break;
+            } /* end block */
+        case H5VL_DATASET_GET_TYPE:
+            {
+                hid_t *ret_id = va_arg(arguments, hid_t *);
+
+                /* Retrieve the dataset's datatype */
+                if((*ret_id = H5Tcopy(dset->type_id)) < 0)
+                    HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get datatype ID of dataset")
+                break;
+            } /* end block */
+        case H5VL_DATASET_GET_DCPL:
+        case H5VL_DATASET_GET_DAPL:
+        case H5VL_DATASET_GET_STORAGE_SIZE:
+        case H5VL_DATASET_GET_OFFSET:
+        default:
+            HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL, "can't get this type of information from dataset")
+    } /* end switch */
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5VL_daosm_dataset_get() */
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_dataset_close_helper
