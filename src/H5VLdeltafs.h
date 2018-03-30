@@ -28,6 +28,7 @@ extern "C" {
 typedef struct H5VL_deltafs_item_t {
     H5I_type_t type;
     struct H5VL_deltafs_file_t *file;
+    int rc;
 } H5VL_deltafs_item_t;
 
 /* Common object information */
@@ -91,7 +92,7 @@ typedef struct H5VL_deltafs_lhead_t {
 typedef struct H5VL_deltafs_file_t {
     H5VL_deltafs_obj_t obj;                 /* Must be first */
     unsigned flags;
-    H5VL_deltafs_lhead_t dlist_head;              /* Dirty dataset list */
+    H5VL_deltafs_lhead_t dlist_head;        /* Dirty dataset list */
     hbool_t dirty;
     int fd;
     H5VL_deltafs_fmd_t fmd;

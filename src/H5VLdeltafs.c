@@ -6,6 +6,8 @@
  * library 
  */
 
+#define H5O_FRIEND              /* Suppress error about including H5Opkg */
+
 #include "H5public.h"
 #include "H5private.h"
 
@@ -18,12 +20,13 @@
 #include "H5MMprivate.h"        /* Memory management                    */
 #include "H5Pprivate.h"         /* Property lists                       */
 #include "H5Sprivate.h"         /* Dataspaces                           */
+#include "H5Opkg.h"
 
 #include "deltafs_api.h"
 
 #define H5VL_DELTAFS_ENABLE_ENV "HDF5_DELTAFS_ENABLE"
 #define H5VL_DELTAFS_SEQ_LIST_LEN 64
-
+#define H5VL_DELTAFS_ROOT_GROUP_INDEX ((size_t)(-2))
 /* 
  * TODO: File data and group data have constant limitations.
  * Solve these
@@ -85,10 +88,23 @@ static void *H5VL_deltafs_group_open(void *_item, H5VL_loc_params_t loc_params,
     const char *name, hid_t gapl_id, hid_t dxpl_id, void **req);
 static herr_t H5VL_deltafs_group_close(void *_grp, hid_t dxpl_id, void **req);
 
+/* Link callbacks */
+static herr_t H5VL_deltafs_link_specific(void *_item, H5VL_loc_params_t loc_params,
+    H5VL_link_specific_t specific_type, hid_t dxpl_id, void **req,
+    va_list arguments);
+
+/* Object Callbacks */
+static void * H5VL_deltafs_object_open(void *_item, H5VL_loc_params_t loc_params, 
+    H5I_type_t *opened_type, hid_t dxpl_id, void **req);
+static herr_t H5VL_deltafs_object_optional(void *_item, hid_t dxpl_id, void **req,
+    va_list arguments);
+static herr_t H5VL_deltafs_object_close(void *_obj, hid_t dxpl_id, void **req);
+
 /* Helper functions */
 static herr_t H5VL_deltafs_file_close_helper(H5VL_deltafs_file_t *file);
 static herr_t H5VL_deltafs_dataset_close_helper(H5VL_deltafs_dset_t *dset);
 static herr_t H5VL_deltafs_group_close_helper(H5VL_deltafs_group_t *grp);
+static hbool_t H5VL_deltafs_is_root_group(H5VL_deltafs_item_t *item);
 
 /* The Deltafs VOL plugin struct */
 static H5VL_class_t H5VL_deltafs_g = {
@@ -167,16 +183,16 @@ static H5VL_class_t H5VL_deltafs_g = {
         NULL,                                   /* copy */
         NULL,                                   /* move */
         NULL,                                   /* get */
-        NULL,                                   /* specific */
+        H5VL_deltafs_link_specific,             /* specific */
         NULL                                    /* optional */
     },
 
     {                                           /* object_cls */
-        NULL,                                   /* open */
+        H5VL_deltafs_object_open,               /* open */
         NULL,                                   /* copy */
         NULL,                                   /* get */
         NULL,                                   /* specific */
-        NULL                                    /* optional */
+        H5VL_deltafs_object_optional            /* optional */
     },
     {
         NULL,
@@ -331,6 +347,7 @@ H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, int fd,
 
     file->obj.item.file = file;
     file->obj.item.type = H5I_FILE;
+    file->obj.item.rc = 1;
     
     file->flags = flags;
     H5VL_DELTAFS_LHEAD_INIT(file->dlist_head);
@@ -628,9 +645,10 @@ H5VL_deltafs_file_close(void *_file, hid_t H5_ATTR_UNUSED dxpl_id,
     /* TODO: Flush file ? */
 
     /* Close the file */
-    if(H5VL_deltafs_file_close_helper(file) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "can't close file")
-
+    if (--file->obj.item.rc == 0) {
+        if(H5VL_deltafs_file_close_helper(file) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "can't close file")
+    }
 done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5VL_deltafs_file_close() */
@@ -664,18 +682,24 @@ H5VL_deltafs_get_group_index(H5VL_deltafs_item_t *item, const char *name,
     HDassert(name);
     HDassert(index);
 
-    if (item->type != H5I_FILE)
+    if (item->type != H5I_FILE && !H5VL_deltafs_is_root_group(item))
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL,
                 "multiple group hierachy not supported")
 
     if (HDstrlen(name) + 1 > HDF5_VOL_DELTAFS_MAX_NAME)
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "group name too long")
 
-    /* TODO: Can use name to get index e.g Step#1 */
-    for (i = 0; i < file->fmd.num_groups; i++) {
-        if (HDstrcmp(file->fmd.gmd[i].name, name) == 0) {
-            gidx = i;
-            break;
+    // File has a default "/" (Root) group
+    if (strcmp(name, "/") == 0) {
+        gidx = H5VL_DELTAFS_ROOT_GROUP_INDEX;
+    } else {
+
+        /* TODO: Can use name to get index e.g Step#1 */
+        for (i = 0; i < file->fmd.num_groups; i++) {
+            if (HDstrcmp(file->fmd.gmd[i].name, name) == 0) {
+                gidx = i;
+                break;
+            }
         }
     }
 
@@ -724,6 +748,7 @@ H5VL_deltafs_group_create_helper(H5VL_deltafs_file_t *file, const char *name)
     
     grp->obj.item.type = H5I_GROUP;
     grp->obj.item.file = file;
+    grp->obj.item.rc = 1;
     grp->index = file->fmd.num_groups++;
 
     HDstrcpy(file->fmd.gmd[grp->index].name, name);
@@ -824,6 +849,7 @@ H5VL_deltafs_group_open_helper(H5VL_deltafs_file_t *file, size_t gidx)
     
     grp->obj.item.type = H5I_GROUP;
     grp->obj.item.file = file;
+    grp->obj.item.rc = 1;
     grp->index = gidx;
     
     ret_value = grp;
@@ -837,6 +863,41 @@ done:
 
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5VL_deltafs_group_open_helper() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_is_root_group
+ *
+ * Purpose:     Checks if the group is root group
+ *
+ * Return:      Success:        TRUE 
+ *              Failure:        FALSE
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static hbool_t
+H5VL_deltafs_is_root_group(H5VL_deltafs_item_t *item)
+{
+    H5VL_deltafs_group_t *grp;
+    hbool_t ret_value = false;
+
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    if (item->type != H5I_GROUP)
+        goto done;
+
+    grp = (H5VL_deltafs_group_t *)item;
+
+    if (grp->index != H5VL_DELTAFS_ROOT_GROUP_INDEX)
+        goto done;
+
+    ret_value = true;
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5VL_deltafs_is_root_group() */
+
 
 
 /*-------------------------------------------------------------------------
@@ -946,13 +1007,15 @@ H5VL_deltafs_group_close(void *_grp, hid_t H5_ATTR_UNUSED dxpl_id,
 
     HDassert(grp);
 
-    if(H5VL_deltafs_group_close_helper(grp) < 0)
-        HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "couldn't close group")
-
+    if (--grp->obj.item.rc == 0) {
+        if(H5VL_deltafs_group_close_helper(grp) < 0)
+            HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "couldn't close group")
+    }
 done:
     FUNC_LEAVE_NOAPI(ret_value)
 
 } /* end H5VL_deltafs_group_close() */
+
 
 #if 0
 /*-------------------------------------------------------------------------
@@ -1220,6 +1283,7 @@ H5VL_deltafs_dataset_create(void *_item,
 
     dset->obj.item.type = H5I_DATASET;
     dset->obj.item.file = item->file;
+    dset->obj.item.rc = 1;
     dset->gidx = gidx;
     dset->didx = didx;
     dset->type_id = FAIL;
@@ -1343,6 +1407,7 @@ H5VL_deltafs_dataset_open(void *_item,
         HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, NULL, "can't allocate Deltafs dataset struct")
     dset->obj.item.type = H5I_DATASET;
     dset->obj.item.file = item->file;
+    dset->obj.item.rc = 1;
     dset->type_id = FAIL;
     dset->space_id = FAIL;
     dset->gidx = gidx;
@@ -1418,15 +1483,13 @@ H5VL_deltafs_xfer(void *_dest_buf, H5S_t *dest_space, const void *_src_buf,
     hbool_t src_sel_iter_init = FALSE;      /* Selection iteration info has been initialized */
     H5S_sel_iter_t dest_sel_iter;
     hbool_t dest_sel_iter_init = FALSE;
-    size_t src_nseq, dest_nseq;
+    size_t src_nseq = 0, dest_nseq = 0;
+    size_t src_i = 0, dest_i = 0;
     size_t src_nelem, dest_nelem;
-    size_t src_nseq_unread = 0;
-    size_t dest_nseq_unread = 0;
     hsize_t src_off[H5VL_DELTAFS_SEQ_LIST_LEN];
     size_t src_len[H5VL_DELTAFS_SEQ_LIST_LEN];
     hsize_t dest_off[H5VL_DELTAFS_SEQ_LIST_LEN];
     size_t dest_len[H5VL_DELTAFS_SEQ_LIST_LEN];
-    size_t src_i, dest_i;
     size_t total_xfer = 0;
     herr_t ret_value = SUCCEED;
 
@@ -1446,18 +1509,20 @@ H5VL_deltafs_xfer(void *_dest_buf, H5S_t *dest_space, const void *_src_buf,
     /* Generate sequences from the file space until finished */
     do {
         /* Get the sequences of bytes */
-        if(src_nseq_unread == 0 && 
-                H5S_SELECT_GET_SEQ_LIST(src_space, 0, &src_sel_iter,
+        if(src_i == src_nseq) {
+                src_i = 0; 
+                if (H5S_SELECT_GET_SEQ_LIST(src_space, 0, &src_sel_iter,
                     (size_t)H5VL_DELTAFS_SEQ_LIST_LEN, (size_t)-1, &src_nseq, &src_nelem, src_off, src_len) < 0)
-            HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
-
-        if(dest_nseq_unread == 0 && 
-                H5S_SELECT_GET_SEQ_LIST(dest_space, 0, &dest_sel_iter,
+                    HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
+        }
+        if(dest_i == dest_nseq) {
+            dest_i = 0;
+            if (H5S_SELECT_GET_SEQ_LIST(dest_space, 0, &dest_sel_iter,
                     (size_t)H5VL_DELTAFS_SEQ_LIST_LEN, (size_t)-1, &dest_nseq, &dest_nelem, dest_off, dest_len) < 0)
-            HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
+                HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
+        }
 
         /* Copy wrt to offsets/lengths */
-        src_i = dest_i = 0;
         while (src_i < src_nseq && dest_i < dest_nseq) {
             size_t xfer_len;
             hsize_t src_offset = src_off[src_i];
@@ -1471,8 +1536,8 @@ H5VL_deltafs_xfer(void *_dest_buf, H5S_t *dest_space, const void *_src_buf,
             } else if (src_len[src_i] > dest_len[dest_i]) {
                 xfer_len = dest_len[src_i];
                 dest_i++;
-                src_len[dest_i] -= xfer_len;
-                src_off[dest_i] += xfer_len;
+                src_len[src_i] -= xfer_len;
+                src_off[src_i] += xfer_len;
             } else {
                 xfer_len = src_len[src_i];
                 src_i++;
@@ -1773,8 +1838,363 @@ H5VL_deltafs_dataset_close(void *_dset, hid_t H5_ATTR_UNUSED dxpl_id,
 
     HDassert(dset);
 
-    ret_value = H5VL_deltafs_dataset_close_helper(dset);
+    if (--dset->obj.item.rc == 0) {
+        ret_value = H5VL_deltafs_dataset_close_helper(dset);
+    }
 
     FUNC_LEAVE_NOAPI(ret_value)
 
 } /* end H5VL_deltafs_dataset_close() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_link_specific
+ *
+ * Purpose:     Specific operations with links
+ *
+ * Return:      Success:        0
+ *              Failure:        -1
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_link_specific(void *_item, H5VL_loc_params_t loc_params,
+    H5VL_link_specific_t specific_type, hid_t H5_ATTR_UNUSED dxpl_id,
+    void H5_ATTR_UNUSED **req, va_list arguments)
+{
+    H5VL_deltafs_item_t *item = (H5VL_deltafs_item_t *)_item;
+    H5VL_deltafs_file_t *file = item->file;
+    void *target_obj = item;
+    hid_t target_obj_id = -1;
+    herr_t ret_value = SUCCEED;    /* Return value */
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    switch (specific_type) {
+        /* H5Lexists */
+        case H5VL_LINK_EXISTS:
+            {
+                htri_t *lexists_ret = va_arg(arguments, htri_t *);
+		        size_t gidx, didx;
+
+                HDassert(H5VL_OBJECT_BY_NAME == loc_params.type);
+
+    		/* 
+	    	 * If item is file, links can be only groups.
+		     * If item is groups, links can be only datasets
+    		 */
+    		if (item->type == H5I_FILE || H5VL_deltafs_is_root_group(item)) {
+	    		if(H5VL_deltafs_get_group_index(item, loc_params.loc_data.loc_by_name.name, &gidx) < 0)
+          			HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "group name invalid")
+    		} else if (item->type == H5I_GROUP) {
+	    		 if (H5VL_deltafs_get_dataset_index(item, loc_params.loc_data.loc_by_name.name, &didx, &gidx, false) < 0)
+        			HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "dataset name invalid")
+    		} else {
+	    		HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "invalid item")
+		    }
+
+                *lexists_ret = 1;
+
+                break;
+            } /* end block */
+
+        case H5VL_LINK_ITER:
+            {
+                hbool_t recursive = va_arg(arguments, int);
+                H5_index_t H5_ATTR_UNUSED idx_type = (H5_index_t)va_arg(arguments, int);
+                H5_iter_order_t order = (H5_iter_order_t)va_arg(arguments, int);
+                hsize_t *idx = va_arg(arguments, hsize_t *);
+                H5L_iterate_t op = va_arg(arguments, H5L_iterate_t);
+                void *op_data = va_arg(arguments, void *);
+                H5L_info_t linfo;
+                herr_t op_ret;
+                char *p;
+		        ssize_t i;
+                size_t num_links;
+		        H5VL_deltafs_group_t *grp = NULL;
+		        hbool_t isFile;
+                hbool_t inc;
+
+                /* Determine the target group */
+                if(loc_params.type == H5VL_OBJECT_BY_SELF) {
+                    /* Use item as attribute parent object, or the root group if item is a
+                     * file */
+                    
+                    if (item->type == H5I_FILE || H5VL_deltafs_is_root_group(item)) {
+	    			    num_links = file->fmd.num_groups;
+		    		    isFile = true; 
+                    } else if(item->type == H5I_GROUP) {
+	    			    grp = (H5VL_deltafs_group_t *)item;
+		    		    num_links = file->fmd.gmd[grp->index].num_dsets;
+			    	    isFile = false;
+    	            } else {
+                        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "item not a file or group")
+			        }	
+                } /* end if */
+        		else {
+                    HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL, "unsupported location params")
+        		} /* end else */
+
+                /* Iteration restart not supported */
+                if(idx && (*idx != 0))
+                    HGOTO_ERROR(H5E_SYM, H5E_UNSUPPORTED, FAIL, "iteration restart not supported (must start from 0)")
+
+                /* Ordered iteration not supported */
+                if(order != H5_ITER_INC && order != H5_ITER_DEC && order != H5_ITER_NATIVE)
+                    HGOTO_ERROR(H5E_SYM, H5E_UNSUPPORTED, FAIL, "ordered iteration not supported")
+
+                /* Recursive iteration not supported */
+                if(recursive)
+                    HGOTO_ERROR(H5E_SYM, H5E_UNSUPPORTED, FAIL, "recusive iteration not supported")
+
+                /* Initialize const linfo info */
+                linfo.corder_valid = FALSE;
+                linfo.corder = 0;
+                linfo.cset = H5T_CSET_ASCII;
+		        linfo.type = H5L_TYPE_HARD;
+		        /* TODO: linfo.u.address needs to be populated with address */
+
+                /* Register id for target_grp */
+                if((target_obj_id = H5VL_object_register(target_obj, item->type, H5VL_DELTAFS_g, TRUE)) < 0)
+                    HGOTO_ERROR(H5E_ATOM, H5E_CANTREGISTER, FAIL, "unable to atomize object handle")
+                ((H5VL_deltafs_item_t *)target_obj)->rc++;
+
+                /* Loop to retrieve groups/datasets and make callbacks */
+        		op_ret = 0;
+                inc = order == H5_ITER_DEC ? false : true;
+        		for((inc == true) ? (i = 0) : (i = (ssize_t)num_links - 1);
+                        (inc == true) ? (i < (ssize_t)num_links) : (i >= 0);
+                        (inc == true) ? i++: i--) {
+		        
+    		        if (isFile) {
+        	    		p =  file->fmd.gmd[i].name;
+    	    	    } else {
+	    	            p = file->fmd.gmd[grp->index].dmd[i].name;
+		            }
+		    
+		            /* Make callback */
+		            if((op_ret = op(target_obj_id, p, &linfo, op_data)) < 0)
+		                HGOTO_ERROR(H5E_SYM, H5E_BADITER, op_ret, "operator function returned failure")
+
+        		    /* Advance idx */
+	        	    if(idx)
+		                (*idx)++;
+
+        		    if (op_ret != 0)
+           		        break;
+
+    		    } /* end if */
+
+                /* Set return value */
+                ret_value = op_ret;
+
+                break;
+            } /* end block */
+        case H5VL_LINK_DELETE:
+            HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL, "unsupported specific operation")
+        default:
+            HGOTO_ERROR(H5E_VOL, H5E_BADVALUE, FAIL, "invalid specific operation")
+    } /* end switch */
+
+done:
+    if(target_obj_id >= 0) {
+        if(H5I_dec_app_ref(target_obj_id) < 0)
+            HDONE_ERROR(H5E_SYM, H5E_CLOSEERROR, FAIL, "can't close group id")
+        target_obj_id = -1;
+    } /* end if */
+
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5VL_deltafs_link_specific() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_object_open
+ *
+ * Purpose:     Opens a Deltafs HDF5 object.
+ *
+ * Return:      Success:        object. 
+ *              Failure:        NULL
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static void *
+H5VL_deltafs_object_open(void *_item, H5VL_loc_params_t loc_params, 
+    H5I_type_t *opened_type, hid_t dxpl_id, void **req)
+{
+    H5VL_deltafs_item_t *item = (H5VL_deltafs_item_t *)_item;
+    void *obj = NULL;
+    H5I_type_t obj_type;
+    H5VL_loc_params_t sub_loc_params;
+    void *ret_value = NULL;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Check loc_params type */
+    if (H5VL_OBJECT_BY_NAME != loc_params.type)
+        HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, NULL, "unsupported location params")
+
+    /* File has only groups as members, groups have only datasets */
+    if(item->type == H5I_FILE || H5VL_deltafs_is_root_group(item)) {
+        obj_type = H5I_GROUP;
+    } else if (item->type == H5I_GROUP) {
+        obj_type = H5I_DATASET;
+	} else {
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "item not a file or group")
+	}
+
+        /* Set up sub_loc_params */
+    sub_loc_params.obj_type = item->type;
+    sub_loc_params.type = H5VL_OBJECT_BY_NAME;
+
+    /* Call type's open function */
+    if(obj_type == H5I_GROUP) {
+        if(NULL == (obj = H5VL_deltafs_group_open(item, sub_loc_params,
+                        loc_params.loc_data.loc_by_name.name,
+                        H5P_GROUP_ACCESS_DEFAULT, dxpl_id, req)))
+            HGOTO_ERROR(H5E_OHDR, H5E_CANTOPENOBJ, NULL, "can't open group")
+    } /* end if */
+    else if(obj_type == H5I_DATASET) {
+        if(NULL == (obj = H5VL_deltafs_dataset_open(item, sub_loc_params,
+                        loc_params.loc_data.loc_by_name.name,
+                        H5P_DATASET_ACCESS_DEFAULT, dxpl_id, req)))
+            HGOTO_ERROR(H5E_OHDR, H5E_CANTOPENOBJ, NULL, "can't open dataset")
+    } /* end if */
+    
+    /* Set return value */
+    if(opened_type)
+        *opened_type = obj_type;
+    ret_value = obj;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5VL_deltafs_object_open() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_object_optional
+ *
+ * Purpose:     Optional operations with objects
+ *
+ * Return:      Success:        0
+ *              Failure:        -1
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_object_optional(void *_item, hid_t H5_ATTR_UNUSED dxpl_id,
+    void H5_ATTR_UNUSED **req, va_list arguments)
+{
+    H5VL_deltafs_item_t *item = (H5VL_deltafs_item_t *)_item;
+    H5VL_deltafs_obj_t *target_obj = NULL;
+    H5VL_object_optional_t optional_type = (H5VL_object_optional_t)va_arg(arguments, int);
+    H5VL_loc_params_t loc_params = va_arg(arguments, H5VL_loc_params_t);
+    herr_t ret_value = SUCCEED;    /* Return value */
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Determine target object */
+    if(item->type != H5I_FILE && item->type != H5I_GROUP && item->type != H5I_DATASET)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "item not a file/group/dataset")
+
+    /* Determine target object */
+    if(loc_params.type == H5VL_OBJECT_BY_SELF) {
+        /* Use item as attribute parent object, or the root group if item is a
+         * file */
+        target_obj = (H5VL_deltafs_obj_t *)item;
+        target_obj->item.rc++;
+    } /* end if */
+    else if(loc_params.type == H5VL_OBJECT_BY_NAME) {
+        /* Open target_obj */
+        if(NULL == (target_obj = (H5VL_deltafs_obj_t *)H5VL_deltafs_object_open(item, loc_params, NULL, dxpl_id, req)))
+            HGOTO_ERROR(H5E_OHDR, H5E_CANTOPENOBJ, FAIL, "can't open object")
+    } /* end else */
+    else
+        HGOTO_ERROR(H5E_OHDR, H5E_UNSUPPORTED, FAIL, "unsupported object operation location parameters type")
+
+    switch (optional_type) {
+        /* H5Oget_info / H5Oget_info_by_name / H5Oget_info_by_idx */
+        case H5VL_OBJECT_GET_INFO:
+            {
+                H5O_info_t  *obj_info = va_arg(arguments, H5O_info_t *);
+
+                /* Initialize obj_info - most fields are not valid and will
+                 * simply be set to 0 */
+                HDmemset(obj_info, 0, sizeof(*obj_info));
+
+                if(target_obj->item.type == H5I_GROUP)
+                    obj_info->type = H5O_TYPE_GROUP;
+                else if(target_obj->item.type == H5I_DATASET)
+                    obj_info->type = H5O_TYPE_DATASET;
+                else
+                    HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "invalid item")
+                break;
+            } /* end block */
+                
+        case H5VL_OBJECT_GET_COMMENT:
+        case H5VL_OBJECT_SET_COMMENT:
+            HGOTO_ERROR(H5E_VOL, H5E_UNSUPPORTED, FAIL, "unsupported optional operation")
+        default:
+            HGOTO_ERROR(H5E_VOL, H5E_BADVALUE, FAIL, "invalid optional operation")
+    } /* end switch */
+
+done:
+    if(target_obj) {
+        if(H5VL_deltafs_object_close(target_obj, dxpl_id, req) < 0)
+            HDONE_ERROR(H5E_OHDR, H5E_CLOSEERROR, FAIL, "can't close object")
+        target_obj = NULL;
+    } /* end else */
+
+
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5VL_deltafs_object_optional() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_object_close
+ *
+ * Purpose:     Closes a deltafs HDF5 object.
+ *
+ * Return:      Success:        0
+ *              Failure:        -1
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_object_close(void *_obj, hid_t dxpl_id, void **req)
+{
+    H5VL_deltafs_obj_t *obj = (H5VL_deltafs_obj_t *)_obj;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    HDassert(obj);
+    HDassert(obj->item.type == H5I_GROUP || obj->item.type == H5I_DATASET);
+
+    /* Call type's close function */
+    if(obj->item.type == H5I_GROUP) {
+        if(H5VL_deltafs_group_close(obj, dxpl_id, req))
+            HGOTO_ERROR(H5E_SYM, H5E_CLOSEERROR, FAIL, "can't close group")
+    } /* end if */
+    else if(obj->item.type == H5I_DATASET) {
+        if(H5VL_deltafs_dataset_close(obj, dxpl_id, req))
+            HGOTO_ERROR(H5E_DATASET, H5E_CLOSEERROR, FAIL, "can't close dataset")
+    } /* end if */
+    else
+        HDassert(0 && "Invalid object type");
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5VL_deltafs_object_close() */
+
