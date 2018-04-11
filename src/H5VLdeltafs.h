@@ -64,6 +64,7 @@ typedef struct H5VL_deltafs_fmd_t {
 typedef struct H5VL_deltafs_dset_t {
     H5VL_deltafs_obj_t obj;                 /* Must be first */
     struct H5VL_deltafs_dset_t *lnext;               /* Link for list */
+    struct H5VL_deltafs_dset_t *lprev;
     hbool_t dirty;
     hid_t type_id;
     hid_t space_id;
@@ -72,7 +73,6 @@ typedef struct H5VL_deltafs_dset_t {
     char *buf;
     size_t buf_size;
     hbool_t is_buf_read;                     /* Has data been read into buf? */
-    size_t rc;
     H5VL_deltafs_dmd_t *dmd;
 } H5VL_deltafs_dset_t;
 
@@ -82,21 +82,34 @@ typedef struct H5VL_deltafs_group_t {
     size_t index;
 } H5VL_deltafs_group_t;
 
-/* Define head */
-typedef struct H5VL_deltafs_lhead_t {
+/* Define head for dataset */
+typedef struct H5VL_deltafs_dhead_t {
     H5VL_deltafs_dset_t *head;
     H5VL_deltafs_dset_t *tail;
-} H5VL_deltafs_lhead_t;
+} H5VL_deltafs_dhead_t;
 
 /* The file struct */
 typedef struct H5VL_deltafs_file_t {
     H5VL_deltafs_obj_t obj;                 /* Must be first */
+    char name[HDF5_VOL_DELTAFS_MAX_NAME];
     unsigned flags;
-    H5VL_deltafs_lhead_t dlist_head;        /* Dirty dataset list */
+    H5VL_deltafs_dhead_t dlist_head;        /* Dirty dataset list */
     hbool_t dirty;
     int fd;
     H5VL_deltafs_fmd_t fmd;
+
+    hbool_t is_open;                        /* File can be opened once only */
+
+    /* Link list */
+    struct H5VL_deltafs_file_t *lnext;
+    struct H5VL_deltafs_file_t *lprev;
 } H5VL_deltafs_file_t;
+
+/* Define head for files */
+typedef struct H5VL_deltafs_fhead {
+    H5VL_deltafs_file_t *head;
+    H5VL_deltafs_file_t *tail;
+} H5VL_deltafs_fhead_t;
 
 /* Macros for list */
 #define H5VL_DELTAFS_LHEAD_INIT(h)      \
@@ -105,18 +118,36 @@ typedef struct H5VL_deltafs_file_t {
     (h).tail = NULL;                    \
 }
 
-#define H5VL_DELTAFS_LELEM_INIT(e)      {(e)->lnext = NULL;}
+#define H5VL_DELTAFS_LELEM_INIT(e)      {(e)->lnext = NULL; (e)->lprev = NULL;}
 #define H5VL_DELTAFS_LGET_FRONT(h)      ((h).head)
+#define H5VL_DELTAFS_LGET_END(h)        ((h).tail)
 #define H5VL_DELTAFS_LADD_TAIL(h, e)    \
 {                                       \
     if ((h).head != NULL) {             \
         (h).tail->lnext = (e);          \
+        (e)->lprev = (h).tail;          \
         (h).tail = (e);                 \
     } else {                            \
         (h).head = (h).tail = (e);      \
+        (e)->lprev = NULL;              \
     }                                   \
     (e)->lnext = NULL;                  \
 }
+#define H5VL_DELTAFS_LREMOVE(h, e)              \
+{                                               \
+    if ((e)->lprev == NULL)                     \
+        (h).head = (e)->lnext;                  \
+                                                \
+    if ((e)->lnext == NULL)                     \
+        (h).tail = (e)->lprev;                   \
+                                                \
+    if ((e)->lprev != NULL)                     \
+        (e)->lprev->lnext = (e)->lnext;         \
+                                                \
+    if ((e)->lnext != NULL)                     \
+        (e)->lnext->lprev = (e)->lprev;         \
+}
+
 #define H5VL_DELTAFS_LFOR_EACH(h, elem) \
     for ((elem) = (h).head; (elem) != NULL; (elem) = (elem)->lnext)
 

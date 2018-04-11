@@ -25,6 +25,7 @@
 #include "deltafs_api.h"
 
 #define H5VL_DELTAFS_ENABLE_ENV "HDF5_DELTAFS_ENABLE"
+#define H5VL_DELTAFS_MPI_RANK_ENV "H5VL_DELTAFS_MPI_RANK"
 #define H5VL_DELTAFS_SEQ_LIST_LEN 64
 #define H5VL_DELTAFS_ROOT_GROUP_INDEX ((size_t)(-2))
 /* 
@@ -39,6 +40,9 @@
 /* VOL plugin value */
 hid_t H5VL_DELTAFS_g = -1;
 hbool_t H5VL_DELTAFS_term = false;
+
+/* Head for the file list */
+H5VL_deltafs_fhead_t H5VL_DELTAFS_fhead;
 
 static herr_t H5VL_deltafs_term(hid_t vtpl_id);
 
@@ -235,6 +239,8 @@ H5VL_deltafs_init(void)
             HGOTO_ERROR(H5E_ATOM, H5E_CANTINSERT, FAIL, "can't create ID for Deltafs plugin")
     } /* end if */
 
+    H5VL_DELTAFS_LHEAD_INIT(H5VL_DELTAFS_fhead);
+
 done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5VL_deltafs_init() */
@@ -312,9 +318,18 @@ done:
 static herr_t
 H5VL_deltafs_term(hid_t H5_ATTR_UNUSED vtpl_id)
 {
+    H5VL_deltafs_file_t *file, *temp;
     herr_t ret_value = SUCCEED;
 
-    FUNC_ENTER_NOAPI_NOINIT_NOERR
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Forcefully close all the open files */
+    H5VL_DELTAFS_LFOR_EACH_SAFE(H5VL_DELTAFS_fhead, file, temp) {
+    
+        if(H5VL_deltafs_file_close_helper(file) < 0)
+            HDONE_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, FAIL, "can't close file");
+
+    } H5VL_DELTAFS_LFOR_EACH_SAFE_END
 
     /* "Forget" plugin id.  This should normally be called by the library
      * when it is closing the id, so no need to close it here. */
@@ -323,6 +338,92 @@ H5VL_deltafs_term(hid_t H5_ATTR_UNUSED vtpl_id)
 
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5VL_deltafs_term() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_file_insert
+ *
+ * Purpose:     Inserts the file struct in global file list
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL_deltafs_file_insert(H5VL_deltafs_file_t *file)
+{
+    
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    H5VL_DELTAFS_LADD_TAIL(H5VL_DELTAFS_fhead, file);
+
+    FUNC_LEAVE_NOAPI_VOID
+}
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_file_remove
+ *
+ * Purpose:     Removes the file struct from the global file list
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static void
+H5VL_deltafs_file_remove(H5VL_deltafs_file_t *file)
+{
+    
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    H5VL_DELTAFS_LREMOVE(H5VL_DELTAFS_fhead, file);
+
+    FUNC_LEAVE_NOAPI_VOID
+}
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_file_find
+ *
+ * Purpose:     Finds file from global file list using name
+ *
+ * Return:      Success:        File structure or NULL
+ *              Failure:        Can't open file for given flags
+
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_file_find(const char *name, hbool_t open_for_write, 
+        H5VL_deltafs_file_t **filp) {
+
+    H5VL_deltafs_file_t *file = NULL;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    H5VL_DELTAFS_LFOR_EACH(H5VL_DELTAFS_fhead, file) {
+
+        if (strcmp(name, file->name) == 0) {
+
+            if (file->is_open)
+                HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open file multiple times concurrently")
+
+            if ((!!(file->flags & H5F_ACC_WRONLY)) != open_for_write)
+                HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can open file for read or write only")
+
+            /* Increase ref count */
+            file->obj.item.rc++;
+            *filp = file;
+            break;
+        }
+    }
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+}
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_file_struct_init
@@ -338,8 +439,9 @@ H5VL_deltafs_term(hid_t H5_ATTR_UNUSED vtpl_id)
  *-------------------------------------------------------------------------
  */
 static herr_t
-H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, int fd,
-        unsigned flags) {
+H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, const char *name,
+        int fd, unsigned flags)
+{
 
     herr_t ret_value = SUCCEED;
     size_t magic_number = HDF5_VOL_DELATFS_FILE_MAGIC_NUMBER;
@@ -352,6 +454,8 @@ H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, int fd,
     file->flags = flags;
     H5VL_DELTAFS_LHEAD_INIT(file->dlist_head);
     file->fd = fd;
+
+    strncpy(file->name, name, HDF5_VOL_DELTAFS_MAX_NAME);
 
     /* If file being created, file metadata needs to be written out */
     if (flags & H5F_ACC_TRUNC || flags & H5F_ACC_EXCL) {
@@ -371,6 +475,12 @@ H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, int fd,
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "bad/corrupted file")
         file->dirty = false;
     }
+
+    file->is_open = true;
+
+    H5VL_DELTAFS_LELEM_INIT(file);
+    H5VL_deltafs_file_insert(file);
+
 
 done:
     FUNC_LEAVE_NOAPI(ret_value)
@@ -400,19 +510,7 @@ H5VL_deltafs_file_create(const char *name, unsigned flags, hid_t fcpl_id,
 
     FUNC_ENTER_NOAPI_NOINIT
 
-    /*
-     * Adjust bit flags by turning on the creation bit and making sure that
-     * the EXCL or TRUNC bit is set.  All newly-created files are opened for
-     * reading and writing.
-     */
-    if(0==(flags & (H5F_ACC_EXCL|H5F_ACC_TRUNC)))
-        flags |= H5F_ACC_EXCL;      /*default*/
-    flags |= H5F_ACC_RDWR | H5F_ACC_CREAT;
-
-    deltafs_flags = O_RDWR;
-    deltafs_flags |= flags & H5F_ACC_EXCL ? O_EXCL | O_CREAT :
-        (flags & H5F_ACC_TRUNC ? O_TRUNC | O_CREAT : 0);
-
+    
     /* Get information from the FAPL */
     if(NULL == (H5P_object_verify(fapl_id, H5P_FILE_ACCESS)))
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "not a file access property list")
@@ -420,6 +518,33 @@ H5VL_deltafs_file_create(const char *name, unsigned flags, hid_t fcpl_id,
     if (fcpl_id != H5P_DEFAULT && fcpl_id != H5P_FILE_CREATE_DEFAULT)
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported creation properties")
 
+    if (strlen(name) + 1 > HDF5_VOL_DELTAFS_MAX_NAME)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "too long filename")
+    /*
+     * If file was already opened in past, return a handle to it
+     */
+    if (H5VL_deltafs_file_find(name, true, &file) < 0) {
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "can't open file")
+    } else if (file != NULL) {
+        file->is_open = true;
+        ret_value = file;
+        goto done;
+    }
+
+    /*
+     * Adjust bit flags by turning on the creation bit and making sure that
+     * the EXCL or TRUNC bit is set.
+     * Deltafs allows only write only or read only opening of files
+     */
+    if(0==(flags & (H5F_ACC_EXCL|H5F_ACC_TRUNC)))
+        flags |= H5F_ACC_EXCL;      /*default*/
+    
+    flags = flags & ~H5F_ACC_RDWR;
+    flags |= H5F_ACC_WRONLY | H5F_ACC_CREAT;
+
+    deltafs_flags = O_WRONLY;
+    deltafs_flags |= flags & H5F_ACC_EXCL ? O_EXCL | O_CREAT :
+        (flags & H5F_ACC_TRUNC ? O_TRUNC | O_CREAT : 0);
     /*
     if (dxpl_id != H5P_DEFAULT)
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported transfer properties")
@@ -432,7 +557,7 @@ H5VL_deltafs_file_create(const char *name, unsigned flags, hid_t fcpl_id,
     if(NULL == (file = H5FL_CALLOC(H5VL_deltafs_file_t)))
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, NULL, "can't allocate Deltafs file struct")
     
-    if (H5VL_deltafs_file_struct_init(file, fd, flags) < 0)
+    if (H5VL_deltafs_file_struct_init(file, name, fd, flags) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "error in file struct init")
 
     ret_value = (void *)file;
@@ -473,7 +598,7 @@ H5VL_deltafs_file_open(const char *name, unsigned flags, hid_t fapl_id,
     hid_t H5_ATTR_UNUSED dxpl_id, void H5_ATTR_UNUSED **req)
 {
     H5VL_deltafs_file_t *file = NULL;
-    int deltafs_flags =  (flags & H5F_ACC_RDWR) ? O_RDWR : O_RDONLY;
+    int deltafs_flags;
     int fd = -1;
     void *ret_value = NULL;
 
@@ -482,6 +607,29 @@ H5VL_deltafs_file_open(const char *name, unsigned flags, hid_t fapl_id,
     /* Get information from the FAPL */
     if(NULL == H5P_object_verify(fapl_id, H5P_FILE_ACCESS))
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "not a file access property list")
+    
+    if (strlen(name) + 1 > HDF5_VOL_DELTAFS_MAX_NAME)
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "too long filename")
+
+    /* 
+     * Deltafs truncates file if opened for write. So no appends, hence
+     * files can only be opened for writes
+     */
+    if (0 != (flags & (H5F_ACC_WRONLY | H5F_ACC_RDWR)))
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "deltafs files can only be opened for reads")
+    
+    deltafs_flags =  O_RDONLY;
+    
+    /*
+     * If file was already opened in past, return a handle to it
+     */
+    if (H5VL_deltafs_file_find(name, false, &file) < 0) {
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "can't open file")
+    } else if (file != NULL) {
+        file->is_open = true;
+        ret_value = file;
+        goto done;
+    }
 
     /*
     if (dxpl_id != H5P_DEFAULT)
@@ -496,7 +644,7 @@ H5VL_deltafs_file_open(const char *name, unsigned flags, hid_t fapl_id,
     if(NULL == (file = H5FL_CALLOC(H5VL_deltafs_file_t)))
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, NULL, "can't allocate Deltafs file struct")
 
-    if (H5VL_deltafs_file_struct_init(file, fd, flags) < 0)
+    if (H5VL_deltafs_file_struct_init(file, name, fd, flags) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "error in file struct init")
 
     ret_value = (void *)file;
@@ -608,8 +756,10 @@ done:
             HGOTO_ERROR(H5E_FILE, H5E_CLOSEERROR, FAIL, "can't close file")
 
     H5VL_DELTAFS_LFOR_EACH_SAFE(file->dlist_head , dset, tempdset) {
-        H5VL_deltafs_dataset_close_helper(dset);    
+        H5VL_deltafs_dataset_close(dset, 0, NULL);    
     } H5VL_DELTAFS_LFOR_EACH_SAFE_END
+
+    H5VL_deltafs_file_remove(file);
 
     file = H5FL_FREE(H5VL_deltafs_file_t, file);
 
@@ -643,6 +793,8 @@ H5VL_deltafs_file_close(void *_file, hid_t H5_ATTR_UNUSED dxpl_id,
     HDassert(file);
 
     /* TODO: Flush file ? */
+
+    file->is_open = false;
 
     /* Close the file */
     if (--file->obj.item.rc == 0) {
@@ -734,7 +886,7 @@ H5VL_deltafs_group_create_helper(H5VL_deltafs_file_t *file, const char *name)
 
     FUNC_ENTER_NOAPI_NOINIT
 
-    HDassert(file->flags & H5F_ACC_RDWR);
+    HDassert(file->flags & H5F_ACC_WRONLY);
 
     if (HDstrlen(name) + 1 > HDF5_VOL_DELTAFS_MAX_NAME)
         HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, NULL, "group name too long")
@@ -793,7 +945,7 @@ H5VL_deltafs_group_create(void *_item,
     FUNC_ENTER_NOAPI_NOINIT
 
     /* Check for write access */
-    if(!(item->file->flags & H5F_ACC_RDWR))
+    if(!(item->file->flags & H5F_ACC_WRONLY))
         HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, NULL, "no write intent on file")
 
     if (gcpl_id != H5P_DEFAULT && gcpl_id != H5P_GROUP_CREATE_DEFAULT)
@@ -1258,7 +1410,7 @@ H5VL_deltafs_dataset_create(void *_item,
 
      
     /* Check for write access */
-    if(!(file->flags & H5F_ACC_RDWR))
+    if(!(file->flags & H5F_ACC_WRONLY))
         HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, NULL, "no write intent on file")
 
     if (dapl_id != H5P_DEFAULT && dapl_id != H5P_DATASET_ACCESS_DEFAULT)
@@ -1292,7 +1444,6 @@ H5VL_deltafs_dataset_create(void *_item,
     dset->buf = NULL;
     dset->buf_size = 0;
     dset->is_buf_read = false;
-    dset->rc = 1;
     dset->dmd = &file->fmd.gmd[gidx].dmd[didx];
     H5VL_DELTAFS_LELEM_INIT(dset);
 
@@ -1345,7 +1496,7 @@ H5VL_deltafs_dataset_create(void *_item,
         HGOTO_ERROR(H5E_DATASET, H5E_CANTENCODE, NULL, "can't serialize dataaspace")
 
     dset->dirty = true;
-    dset->rc++;
+    dset->obj.item.rc++;
     H5VL_DELTAFS_LADD_TAIL(item->file->dlist_head, dset);
 
     /* Set return value */
@@ -1416,7 +1567,6 @@ H5VL_deltafs_dataset_open(void *_item,
     dset->buf = NULL;
     dset->buf_size = dmd->size;
     dset->is_buf_read = false;
-    dset->rc = 1;
     dset->dmd = dmd;
     H5VL_DELTAFS_LELEM_INIT(dset);
 
@@ -1440,7 +1590,7 @@ H5VL_deltafs_dataset_open(void *_item,
     if(H5Sselect_all(dset->space_id) < 0)
         HGOTO_ERROR(H5E_DATASPACE, H5E_CANTDELETE, NULL, "can't change selection")
 
-    dset->rc++;
+    dset->obj.item.rc++;
     H5VL_DELTAFS_LADD_TAIL(file->dlist_head, dset);
 
     /* TODO: Retrieve stored values */
@@ -1671,7 +1821,7 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     FUNC_ENTER_NOAPI_NOINIT
 
     /* Check for write access */
-    if(!(file->flags & H5F_ACC_RDWR))
+    if(!(file->flags & H5F_ACC_WRONLY))
         HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "no write intent on file")
 
     /*
@@ -1797,18 +1947,16 @@ H5VL_deltafs_dataset_close_helper(H5VL_deltafs_dset_t *dset)
 
     HDassert(dset);
 
-    if(--dset->rc == 0) {
-        /* Free dataset data structures */
-        if(dset->type_id != FAIL && H5I_dec_app_ref(dset->type_id) < 0)
-            HDONE_ERROR(H5E_DATASET, H5E_CANTDEC, FAIL, "failed to close datatype")
-        if(dset->space_id != FAIL && H5I_dec_app_ref(dset->space_id) < 0)
-            HDONE_ERROR(H5E_DATASET, H5E_CANTDEC, FAIL, "failed to close dataspace")
+    /* Free dataset data structures */
+    if(dset->type_id != FAIL && H5I_dec_app_ref(dset->type_id) < 0)
+        HDONE_ERROR(H5E_DATASET, H5E_CANTDEC, FAIL, "failed to close datatype")
+    if(dset->space_id != FAIL && H5I_dec_app_ref(dset->space_id) < 0)
+        HDONE_ERROR(H5E_DATASET, H5E_CANTDEC, FAIL, "failed to close dataspace")
         
-        if(dset->buf)
-            H5MM_xfree(dset->buf);
+    if(dset->buf)
+        H5MM_xfree(dset->buf);
 
-        dset = H5FL_FREE(H5VL_deltafs_dset_t, dset);
-    } /* end if */
+    dset = H5FL_FREE(H5VL_deltafs_dset_t, dset);
 
     FUNC_LEAVE_NOAPI(ret_value)
 }

@@ -53,6 +53,7 @@
 #define H5F_ACC_RDWR	(H5CHECK H5OPEN 0x0001u)	/*open for read and write    */
 #define H5F_ACC_TRUNC	(H5CHECK H5OPEN 0x0002u)	/*overwrite existing files   */
 #define H5F_ACC_EXCL	(H5CHECK H5OPEN 0x0004u)	/*fail if file already exists*/
+#define H5F_ACC_WRONLY  (H5CHECK H5OPEN 0x0008u)    /* For write only */
 /* NOTE: 0x0008u was H5F_ACC_DEBUG, now deprecated */
 #define H5F_ACC_CREAT	(H5CHECK H5OPEN 0x0010u)	/*create non-existing files  */
 
