@@ -13,12 +13,12 @@
 
 #include "deltafs_api.h"
 
-#define HDF5_VOL_DELTAFS_VERSION_1	1	/* Version number of VOL plugin */
-#define HDF5_VOL_DELTAFS_MAX_NAME   32  /* Max number of character in group/dataset/file name */
-#define HDF5_VOL_DELTAFS_MAX_DATASET    8   /* Max dataset in a group */
-#define HDF5_VOL_DELTAFS_MAX_GROUP      8   /* Max groups in a file */
+#define HDF5_VOL_DELTAFS_VERSION_1	    1	    /* Version number of VOL plugin */
+#define HDF5_VOL_DELTAFS_MAX_NAME       256     /* Max number of character in group/dataset/file name */
 
-#define HDF5_VOL_DELATFS_FILE_MAGIC_NUMBER  (size_t)0xAA55AA55
+/* TODO: Remove this limitation */
+#define HDF5_VOL_DELTAFS_MAX_DATASET    32      /* Max dataset in a group */
+
 
 #ifdef __cplusplus
 extern "C" {
@@ -38,67 +38,60 @@ typedef struct H5VL_deltafs_obj_t {
 
 /* The dataset metadata stored in a delta file */
 typedef struct H5VL_deltafs_dmd_t {
-    char name[HDF5_VOL_DELTAFS_MAX_NAME];
-    size_t offset;                          /* Offset in file */
-    size_t size;                            /* Total size of data */
-    size_t type_size;
-    size_t space_size;
+    char name[HDF5_VOL_DELTAFS_MAX_NAME + 1];
+    hid_t type_id;
+    char *type_buf;
+    size_t type_buf_size;
+    hbool_t is_initialized;
 } H5VL_deltafs_dmd_t;
-
-/* The group metadata stored in deltafs file */
-typedef struct H5VL_deltafs_gmd_t {
-    char name[HDF5_VOL_DELTAFS_MAX_NAME];
-    H5VL_deltafs_dmd_t dmd[HDF5_VOL_DELTAFS_MAX_DATASET];
-    size_t num_dsets;
-} H5VL_deltafs_gmd_t;
 
 /* The file metadata stored in deltafs file */
 typedef struct H5VL_deltafs_fmd_t {
+    size_t total_ranks;                 /* Total number of process */
     size_t num_groups;
-    size_t write_offset;                    /* Offset where to write next */
-    H5VL_deltafs_gmd_t gmd[HDF5_VOL_DELTAFS_MAX_GROUP];
-    size_t magic_number;            /* Magic number to check the consistency */
+    size_t num_datasets;
+    hbool_t is_datasets_finalized;      /* Have the num of datasets fixed */
+    H5VL_deltafs_dmd_t dmd[HDF5_VOL_DELTAFS_MAX_DATASET];
 } H5VL_deltafs_fmd_t;
 
 /* The dataset struct */
 typedef struct H5VL_deltafs_dset_t {
     H5VL_deltafs_obj_t obj;                 /* Must be first */
-    struct H5VL_deltafs_dset_t *lnext;               /* Link for list */
-    struct H5VL_deltafs_dset_t *lprev;
-    hbool_t dirty;
-    hid_t type_id;
-    hid_t space_id;
-    size_t didx;
-    size_t gidx;
-    char *buf;
-    size_t buf_size;
-    hbool_t is_buf_read;                     /* Has data been read into buf? */
+    char name[HDF5_VOL_DELTAFS_MAX_NAME + 1];
+    struct H5VL_deltafs_group_t *parent_grp;
+    size_t index;
     H5VL_deltafs_dmd_t *dmd;
+
 } H5VL_deltafs_dset_t;
 
 /* The group struct */
 typedef struct H5VL_deltafs_group_t {
     H5VL_deltafs_obj_t obj;                 /* Must be first */
     size_t index;
-} H5VL_deltafs_group_t;
+    size_t num_datasets;
+    size_t num_elems;
 
-/* Define head for dataset */
-typedef struct H5VL_deltafs_dhead_t {
-    H5VL_deltafs_dset_t *head;
-    H5VL_deltafs_dset_t *tail;
-} H5VL_deltafs_dhead_t;
+    char *buf;
+    size_t buf_filled_len;                  /* How much has buffer been written */
+    size_t buf_size;
+    hbool_t is_read;                        /* Has group buffer been read ? */
+    hbool_t dirty;
+
+} H5VL_deltafs_group_t;
 
 /* The file struct */
 typedef struct H5VL_deltafs_file_t {
     H5VL_deltafs_obj_t obj;                 /* Must be first */
-    char name[HDF5_VOL_DELTAFS_MAX_NAME];
+    char name[HDF5_VOL_DELTAFS_MAX_NAME + 1];
     unsigned flags;
-    H5VL_deltafs_dhead_t dlist_head;        /* Dirty dataset list */
-    hbool_t dirty;
-    int fd;
     H5VL_deltafs_fmd_t fmd;
 
-    hbool_t is_open;                        /* File can be opened once only */
+    size_t rank;                            /* MPI rank of process */
+    deltafs_plfsdir_t *handle;              /* Deltafs handle for the file */
+    size_t max_grp_buf_size;                /* Max allocated buffer size of grp */
+
+    hbool_t is_open;                        /* File can be opened once only at a time */
+    hbool_t dirty;
 
     /* Link list */
     struct H5VL_deltafs_file_t *lnext;
@@ -110,6 +103,15 @@ typedef struct H5VL_deltafs_fhead {
     H5VL_deltafs_file_t *head;
     H5VL_deltafs_file_t *tail;
 } H5VL_deltafs_fhead_t;
+
+/* Struct for deltafs scanner callback arg */
+typedef struct H5VL_deltafs_cb_arg {
+
+    hbool_t fail;                           /* Has the callback failed? */
+    hsize_t elem_size;
+    H5VL_deltafs_group_t *grp;
+
+} H5VL_deltafs_cb_arg_t;
 
 /* Macros for list */
 #define H5VL_DELTAFS_LHEAD_INIT(h)      \
