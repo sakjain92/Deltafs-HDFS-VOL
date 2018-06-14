@@ -15,6 +15,7 @@
 
 #define HDF5_VOL_DELTAFS_VERSION_1	    1	    /* Version number of VOL plugin */
 #define HDF5_VOL_DELTAFS_MAX_NAME       256     /* Max number of character in group/dataset/file name */
+#define HDF5_VOL_DELTAFS_MD_FNAME       "HDF5_MD"   /* Metadata filename */
 
 /* TODO: Remove this limitation */
 #define HDF5_VOL_DELTAFS_MAX_DATASET    32      /* Max dataset in a group */
@@ -85,9 +86,9 @@ typedef struct H5VL_deltafs_file_t {
     char name[HDF5_VOL_DELTAFS_MAX_NAME + 1];
     unsigned flags;
     H5VL_deltafs_fmd_t fmd;
-
-    size_t rank;                            /* MPI rank of process */
-    deltafs_plfsdir_t *handle;              /* Deltafs handle for the file */
+    deltafs_plfsdir_t *fmd_handle;
+    
+    int rank;                               /* MPI rank of process */
     size_t max_grp_buf_size;                /* Max allocated buffer size of grp */
 
     hbool_t is_open;                        /* File can be opened once only at a time */
@@ -123,6 +124,7 @@ typedef struct H5VL_deltafs_cb_arg {
 #define H5VL_DELTAFS_LELEM_INIT(e)      {(e)->lnext = NULL; (e)->lprev = NULL;}
 #define H5VL_DELTAFS_LGET_FRONT(h)      ((h).head)
 #define H5VL_DELTAFS_LGET_END(h)        ((h).tail)
+#define H5VL_DELTAFS_IS_EMPTY(h)        ((h).head == NULL)
 #define H5VL_DELTAFS_LADD_TAIL(h, e)    \
 {                                       \
     if ((h).head != NULL) {             \

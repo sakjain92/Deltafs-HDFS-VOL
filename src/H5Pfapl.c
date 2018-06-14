@@ -349,7 +349,8 @@ H5P__facc_reg_prop(H5P_genclass_t *pclass)
 
     /* If deltafs is enabled, then set default VOL to deltafs */
     if (H5VL_deltafs_is_enabled()) {
-        H5VL_deltafs_set_plugin_prop(&def_vol_prop);        
+        if (H5VL_deltafs_set_plugin_prop(&def_vol_prop) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTINSERT, FAIL, "can't insert VOL property into class")
     }
 
     /* Register the initial metadata cache resize configuration */
@@ -511,6 +512,28 @@ H5P__facc_reg_prop(H5P_genclass_t *pclass)
 done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5P__facc_reg_prop() */
+
+
+/*-------------------------------------------------------------------------
+ * Function:	H5Pget_default_VOL_prop
+ *
+ * Return:	Returns the default VOL's plugin prop, else error
+ *
+ * Programmer:	Saksham Jain
+ *              Monday, May  28, 2018
+ *-------------------------------------------------------------------------
+ */
+herr_t
+H5Pget_default_VOL_prop(H5VL_plugin_prop_t *prop)
+{
+    H5VL_plugin_prop_t def_vol_prop = H5F_ACS_VOL_DEF; 
+    herr_t ret_value = SUCCEED;         /* Return value */
+
+    *prop = def_vol_prop;
+
+    return ret_value;
+}
+
 
 
 /*-------------------------------------------------------------------------

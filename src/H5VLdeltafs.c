@@ -23,20 +23,22 @@
 #include "H5Opkg.h"
 
 #include "deltafs_api.h"
+#include "deltafs_preload.h"
 
 #define H5VL_DELTAFS_ENABLE_ENV                 "HDF5_DELTAFS_ENABLE"
+#define H5VL_DELTAFS_WRITE_ENABLE_ENV           "HDF5_DELTAFS_WRITE_ENABLE"
 #define H5VL_DELTAFS_SEQ_LIST_LEN               64
 #define H5VL_DELTAFS_ROOT_GROUP_INDEX           ((size_t)(LONG_MAX))
 
 #define H5VL_DELTAFS_FMD_NUM_GROUP_KEY          "__num_groups"
+#define H5VL_DELTAFS_FMD_GROUP_NAME_KEY         "__name_groups"
+#define H5VL_DELTAFS_FMD_GROUP_RNAME_KEY        "__name_rgroups"
 #define H5VL_DELTAFS_FMD_NUM_DATASET_KEY        "__num_datasets"
 #define H5VL_DELTAFS_FMD_DATASET_NAME_KEY       "__name_datasets"
 #define H5VL_DELTAFS_FMD_DATASET_TYPE_KEY       "__type_datasets"
 #define H5VL_DELTAFS_FMD_MAGIC_NUMBER_KEY       "__magic_number"
 #define H5VL_DELTAFS_FMD_TOTAL_RANK             "__total_rank"
 #define HDF5_DELATFS_FILE_MAGIC_NUMBER          "AA55AA55"
-
-#define H5VL_DELTAFS_H5PART_GROUPNAME_STEP	    "Step"
 
 /* Units (in bytes) in which to increment buffer */
 #define H5VL_DELTAFS_BUF_SIZE_INC               4096
@@ -53,11 +55,13 @@
 /* VOL plugin value */
 hid_t H5VL_DELTAFS_g = -1;
 hbool_t H5VL_DELTAFS_term = false;
+hbool_t H5VL_DELTAFS_init_preload = false;
 
 /* Head for the file list */
 H5VL_deltafs_fhead_t H5VL_DELTAFS_fhead;
 
 static herr_t H5VL_deltafs_term(hid_t vtpl_id);
+static hbool_t H5VL_deltafs_is_write_enabled(void);
 
 #if 0
 /* Attribute callbacks */
@@ -240,10 +244,22 @@ H5FL_DEFINE(H5VL_deltafs_dset_t);
 herr_t
 H5VL_deltafs_init(void)
 {
-    herr_t ret_value = SUCCEED;            /* Return value */
     void *p;
+    herr_t ret_value = SUCCEED;            /* Return value */
 
     FUNC_ENTER_NOAPI(FAIL)
+
+    if (H5VL_deltafs_is_write_enabled()) {
+
+        deltafs_preload_early_init();
+        deltafs_preload_late_init(MPI_COMM_WORLD);
+
+        /* As read path only supports plfsdir currently */
+        if (!deltafs_preload_plfsdir_enabled())
+            HGOTO_ERROR(H5E_ATOM, H5E_CANTINSERT, FAIL, "plfsdir feature not enabled")
+    
+        H5VL_DELTAFS_init_preload = true;
+    }
 
     /* Register the DELTAFS VOL, if it isn't already */
     if(NULL == (p = H5I_object_verify(H5VL_DELTAFS_g, H5I_VOL))) {
@@ -284,6 +300,32 @@ H5VL_deltafs_is_enabled(void) {
     FUNC_LEAVE_NOAPI(ret_value)
     return ret_value;
 }
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_is_write_enabled
+ *
+ * Purpose:     Checks whether write is enabled for H5VL deltafs
+ *
+ * Return:      TRUE: Deltafs enabled
+ *              FALSE: Deltafs not enabled
+ *
+ * Programmer:  Saksham Jain
+ *              March 2018
+ *-------------------------------------------------------------------------
+ */
+hbool_t
+H5VL_deltafs_is_write_enabled(void) {
+
+    hbool_t ret_value = FALSE;
+
+    FUNC_ENTER_NOAPI_NOERR
+
+    ret_value = (NULL != HDgetenv(H5VL_DELTAFS_WRITE_ENABLE_ENV));
+
+    FUNC_LEAVE_NOAPI(ret_value)
+    return ret_value;
+}
+
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_set_plugin_prop
@@ -336,6 +378,10 @@ H5VL_deltafs_term(hid_t H5_ATTR_UNUSED vtpl_id)
 
     FUNC_ENTER_NOAPI_NOINIT
 
+    /* This function might be called multiple times */
+    if (H5VL_DELTAFS_term)
+        goto done;
+
     /* Forcefully close all the open files */
     H5VL_DELTAFS_LFOR_EACH_SAFE(H5VL_DELTAFS_fhead, file, temp) {
     
@@ -344,6 +390,9 @@ H5VL_deltafs_term(hid_t H5_ATTR_UNUSED vtpl_id)
 
     } H5VL_DELTAFS_LFOR_EACH_SAFE_END
 
+    if (H5VL_DELTAFS_init_preload)
+        deltafs_preload_deinit();
+
     /* 
      * "Forget" plugin id.  This should normally be called by the library
      * when it is closing the id, so no need to close it here.
@@ -351,6 +400,7 @@ H5VL_deltafs_term(hid_t H5_ATTR_UNUSED vtpl_id)
     H5VL_DELTAFS_g = -1;
     H5VL_DELTAFS_term = true;
 
+done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5VL_deltafs_term() */
 
@@ -369,6 +419,9 @@ H5VL_deltafs_file_insert(H5VL_deltafs_file_t *file)
 {
     
     FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    HDassert(H5VL_DELTAFS_IS_EMPTY(H5VL_DELTAFS_fhead) && 
+            "Currently H5VL deltafs only supports one file");
 
     H5VL_DELTAFS_LADD_TAIL(H5VL_DELTAFS_fhead, file);
     file->obj.item.rc++;
@@ -441,6 +494,78 @@ done:
 }
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_open_fmd_handle
+ *
+ * Purpose:     Opens metadata file's handle
+ *
+ * Return:      Success:        Fills in handle in file struct
+ *              Failure:        Can't open metadata file
+
+ *
+ * Programmer:  Saksham Jain
+ *              June, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_open_fmd_handle(H5VL_deltafs_file_t *file)
+{
+    deltafs_plfsdir_t *handle = NULL;
+    char fname[PATH_MAX];
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Only rank 0 is allowed to operate on the fmd handle */
+    HDassert(file->rank == 0);
+
+    if ((file->flags & H5F_ACC_WRONLY) == H5F_ACC_WRONLY) {
+       if (deltafs_preload_append_to_plfdir_local_root(HDF5_VOL_DELTAFS_MD_FNAME, fname, sizeof(fname)) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "invalid local root");
+
+        if ((handle = deltafs_plfsdir_create_handle("", O_WRONLY, 0)) == NULL)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't create deltafs handle")
+
+        if (deltafs_plfsdir_set_rank(handle, 0) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't set rank in deltafs handle")
+ 
+        if (deltafs_plfsdir_open(handle, fname) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open rank 0 file")
+
+    } else {
+        
+        /* Get the metadata filename */
+        snprintf(fname, sizeof(fname), "%s/%s", file->name, HDF5_VOL_DELTAFS_MD_FNAME);
+
+        if ((handle = deltafs_plfsdir_create_handle("", O_RDONLY, 0)) == NULL)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't create deltafs handle")
+
+        /* Rank 0 has all the metadata */
+        if (deltafs_plfsdir_set_rank(handle, 0) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't set rank in deltafs handle")
+ 
+        if (deltafs_plfsdir_open(handle, fname) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open rank 0 file")
+
+    }
+
+    file->fmd_handle = handle;
+
+done:
+    if (ret_value != SUCCEED && handle != NULL) {
+
+        if (0 != deltafs_plfsdir_finish(handle))
+            HDONE_ERROR(H5E_FILE, H5E_CLOSEERROR, FAIL, "can't close file")
+
+        if (deltafs_plfsdir_free_handle(handle) < 0)
+            HDONE_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't free handle")
+    }
+
+    FUNC_LEAVE_NOAPI(ret_value)
+
+}
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_read_fmd
  *
  * Purpose:     Reads the file metadata
@@ -457,7 +582,7 @@ done:
 static herr_t
 H5VL_deltafs_read_fmd(H5VL_deltafs_file_t *file)
 {
-    deltafs_plfsdir_t *handle = NULL;
+    deltafs_plfsdir_t *handle = file->fmd_handle;
     H5VL_deltafs_fmd_t *fmd = &file->fmd;
     long long int num_groups, num_datasets, total_ranks;
     size_t size, i, keylen;
@@ -467,16 +592,6 @@ H5VL_deltafs_read_fmd(H5VL_deltafs_file_t *file)
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
-
-    if ((handle = deltafs_plfsdir_create_handle("", O_RDONLY, 0)) == NULL)
-        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't create deltafs handle")
-
-    /* Rank 0 has all the metadata */
-    if (deltafs_plfsdir_set_rank(handle, 0) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't set rank in deltafs handle")
- 
-    if (deltafs_plfsdir_open(handle, file->name) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open rank 0 file")
 
     /* Get magic number */
     if ((value = (char *)deltafs_plfsdir_read(handle,
@@ -578,11 +693,6 @@ H5VL_deltafs_read_fmd(H5VL_deltafs_file_t *file)
     }
 
 done:
-    if (handle != NULL) {
-        if (deltafs_plfsdir_free_handle(handle) < 0)
-            HDONE_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't free handle")
-    }
-
     free(value);
 
     H5MM_xfree(key);
@@ -607,7 +717,7 @@ done:
 static herr_t
 H5VL_deltafs_write_fmd(H5VL_deltafs_file_t *file)
 {
-    deltafs_plfsdir_t *handle = file->handle;
+    deltafs_plfsdir_t *handle = file->fmd_handle;
     H5VL_deltafs_fmd_t *fmd = &file->fmd;
     size_t i, keylen, valuelen;
     char *value = NULL;
@@ -685,6 +795,7 @@ done:
 
     FUNC_LEAVE_NOAPI(ret_value)
 }
+
 /*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_file_struct_init
  *
@@ -700,7 +811,7 @@ done:
  */
 static herr_t
 H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, const char *name,
-        unsigned flags)
+        unsigned flags, int rank)
 {
 
     herr_t ret_value = SUCCEED;
@@ -712,12 +823,15 @@ H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, const char *name,
     file->obj.item.rc = 1;
     strncpy(file->name, name, HDF5_VOL_DELTAFS_MAX_NAME);
     file->flags = flags;
-    file->rank = 0;
-    file->handle = NULL;
+    file->fmd_handle = NULL;
+    file->rank = rank;
     file->max_grp_buf_size = 0;
     
+    if (rank == 0 && H5VL_deltafs_open_fmd_handle(file) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open metadata file")
+
     /* If file being created, file metadata needs to be written out when it closes */
-    if (flags & H5F_ACC_TRUNC || flags & H5F_ACC_EXCL) {
+    if ((flags & H5F_ACC_WRONLY) == H5F_ACC_WRONLY) {
         HDmemset(&file->fmd, 0, sizeof(file->fmd));
         file->dirty = true;
     } else {
@@ -755,7 +869,6 @@ H5VL_deltafs_file_create(const char *name, unsigned flags, hid_t fcpl_id,
     hid_t fapl_id, hid_t H5_ATTR_UNUSED dxpl_id, void H5_ATTR_UNUSED **req)
 {
     H5VL_deltafs_file_t *file = NULL;
-    deltafs_plfsdir_t *handle = NULL;
 #ifdef H5_HAVE_PARALLEL
     MPI_Comm comm = MPI_COMM_NULL;
     MPI_Info info = MPI_INFO_NULL;
@@ -768,7 +881,10 @@ H5VL_deltafs_file_create(const char *name, unsigned flags, hid_t fcpl_id,
     
     if (fcpl_id != H5P_DEFAULT && fcpl_id != H5P_FILE_CREATE_DEFAULT)
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported creation properties")
-    
+   
+    if (!H5VL_deltafs_is_write_enabled())
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "deltafs write not enabled")
+
     /*
     if (dxpl_id != H5P_DEFAULT)
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported transfer properties")
@@ -817,26 +933,14 @@ H5VL_deltafs_file_create(const char *name, unsigned flags, hid_t fcpl_id,
     total_ranks = 1;
     rank = 0;
 #endif
-
-    if ((handle = deltafs_plfsdir_create_handle("", O_WRONLY, 0)) == NULL)
-        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, NULL, "can't create deltafs handle")
-
-    if (deltafs_plfsdir_set_rank(handle, rank) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, NULL, "can't set rank in deltafs handle")
- 
-    if (deltafs_plfsdir_open(handle, name) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "can't open file")
-    
     /* allocate the file object that is returned to the user */
     if (NULL == (file = H5FL_CALLOC(H5VL_deltafs_file_t)))
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, NULL, "can't allocate Deltafs file struct")
     
-    if (H5VL_deltafs_file_struct_init(file, name, flags) < 0)
+    if (H5VL_deltafs_file_struct_init(file, name, flags, rank) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "error in file struct init")
 
-    file->rank = (size_t)rank;
     file->fmd.total_ranks = (size_t)total_ranks;
-    file->handle = handle;
 
     ret_value = (void *)file;
 
@@ -858,15 +962,9 @@ done:
         if(file) {
             if(H5VL_deltafs_file_close_helper(file) < 0)
                 HDONE_ERROR(H5E_FILE, H5E_CANTCLOSEFILE, NULL, "can't close file")
-        } else if(handle != NULL) {
-            
-            if (0 != deltafs_plfsdir_finish(handle))
-                HDONE_ERROR(H5E_FILE, H5E_CLOSEERROR, NULL, "can't close file")
-
-            if (0 != deltafs_plfsdir_free_handle(handle))
-                HDONE_ERROR(H5E_FILE, H5E_CLOSEERROR, NULL, "can't close file")
-        }     
-    } /* end if */
+        }
+    
+    }/* end if */
 
 
     FUNC_LEAVE_NOAPI(ret_value)
@@ -903,7 +1001,7 @@ H5VL_deltafs_file_open(const char *name, unsigned flags, hid_t fapl_id,
 
     /* 
      * Deltafs truncates file if opened for write. So no appends, hence
-     * files can only be opened for writes
+     * files can only be opened for reads
      */
     if (0 != (flags & (H5F_ACC_WRONLY | H5F_ACC_RDWR)))
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "deltafs files can only be opened for reads")
@@ -928,7 +1026,7 @@ H5VL_deltafs_file_open(const char *name, unsigned flags, hid_t fapl_id,
     if(NULL == (file = H5FL_CALLOC(H5VL_deltafs_file_t)))
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, NULL, "can't allocate Deltafs file struct")
 
-    if (H5VL_deltafs_file_struct_init(file, name, flags) < 0)
+    if (H5VL_deltafs_file_struct_init(file, name, flags, 0) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "error in file struct init")
 
     ret_value = (void *)file;
@@ -1026,12 +1124,12 @@ H5VL_deltafs_file_close_helper(H5VL_deltafs_file_t *file)
         H5MM_xfree(dmd->type_buf);
     }
     
-    if (file->handle != NULL) {
-        if (0 != deltafs_plfsdir_finish(file->handle))
+    if (file->fmd_handle != NULL) {
+        if (0 != deltafs_plfsdir_finish(file->fmd_handle))
             HDONE_ERROR(H5E_FILE, H5E_CLOSEERROR, FAIL, "can't close file")
 
-        if (0 != deltafs_plfsdir_free_handle(file->handle))
-            HDONE_ERROR(H5E_FILE, H5E_CLOSEERROR, FAIL, "can't close file")
+        if (deltafs_plfsdir_free_handle(file->fmd_handle) < 0)
+            HDONE_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't free handle")
     }
 
     H5VL_deltafs_file_remove(file);
@@ -1110,6 +1208,141 @@ done:
 } /* end H5VL_deltafs_is_root_group() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_store_group_name
+ *
+ * Purpose:     Stores the group name, along with the group index in metadata
+ *              file
+ *
+ * Return:      Success:        Success
+ *              Failure:        error
+ *
+ * Programmer:  Saksham Jain
+ *              June, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_store_group_name(H5VL_deltafs_file_t *file, const char *name,
+                            size_t gidx)
+{
+    char sname[HDF5_VOL_DELTAFS_MAX_NAME + 1];
+    char srevname[HDF5_VOL_DELTAFS_MAX_NAME + 1];
+    char sindex[30];
+    herr_t ret_value = SUCCEED;
+    
+    /* TODO: How to check if the group name is unique? */
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Only rank 0 deals with file metadata */
+    HDassert(file->rank == 0);
+    HDassert(file->fmd_handle);
+    HDassert(HDstrlen(name) <= HDF5_VOL_DELTAFS_MAX_NAME);
+
+    /* 
+     * During read, we want to get gidx from group name and also get group name
+     * from gidx.
+     */
+    snprintf(sname, sizeof(sname), "%s:%s", H5VL_DELTAFS_FMD_GROUP_NAME_KEY, name);
+    snprintf(srevname, sizeof(srevname), "%s:%zu", H5VL_DELTAFS_FMD_GROUP_RNAME_KEY, gidx);
+    snprintf(sindex, sizeof(sindex), "%zu", gidx);
+
+    if (deltafs_plfsdir_append(file->fmd_handle, sname, -1, sindex, HDstrlen(sindex) + 1) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't store group name")
+    if (deltafs_plfsdir_append(file->fmd_handle, srevname, -1, name, HDstrlen(name) + 1) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't store group name")
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+} /* end H5VL_deltafs_store_group_name */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_read_group_name
+ *
+ * Purpose:     Given group index, returns the group name
+ *
+ * Return:      Success:        group name. Needs to be freed
+ *              Failure:        NULL
+ *
+ * Programmer:  Saksham Jain
+ *              June, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static char *
+H5VL_deltafs_read_group_name(H5VL_deltafs_file_t *file, size_t gidx)
+{
+    char *name;
+    char srevname[HDF5_VOL_DELTAFS_MAX_NAME + 1];
+    size_t size;
+    char *ret_value = NULL;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    HDassert(file->rank == 0);
+    HDassert(file->fmd_handle);
+
+    snprintf(srevname, sizeof(srevname), "%s:%zu", H5VL_DELTAFS_FMD_GROUP_RNAME_KEY, gidx);
+
+    if ((name = (char *)deltafs_plfsdir_read(file->fmd_handle, srevname, -1,
+                                &size, NULL, NULL)) == NULL)
+        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, NULL, "can't get group name")
+
+    ret_value = name;
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+}
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_read_group_index
+ *
+ * Purpose:     Given group name, returns the group inde
+ *
+ * Return:      Success:        group index
+ *              Failure:        error
+ *
+ * Programmer:  Saksham Jain
+ *              June, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_read_group_index(H5VL_deltafs_file_t *file, const char *name, size_t *gidx)
+{
+    char sname[HDF5_VOL_DELTAFS_MAX_NAME + 1];
+    size_t size;
+    char *value;
+    long long index;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    HDassert(file->rank == 0);
+    HDassert(file->fmd_handle);
+    HDassert(HDstrlen(name) <= HDF5_VOL_DELTAFS_MAX_NAME);
+
+    snprintf(sname, sizeof(sname), "%s:%s", H5VL_DELTAFS_FMD_GROUP_NAME_KEY, name);
+
+    if ((value = (char *)deltafs_plfsdir_read(file->fmd_handle, sname, -1,
+                                &size, NULL, NULL)) == NULL)
+        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't get group index")
+
+    /* TODO: Do more error checks */
+    if ((index = strtoll(value, NULL, 10)) < 0 ||
+            index == LLONG_MAX || index == LLONG_MIN)
+        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't get total rank")
+    
+    *gidx = (size_t)index;
+
+    free(value);
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+}
+
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_get_group_index
  *
  * Purpose:     Given a path name and base object, returns the final group 
@@ -1128,7 +1361,7 @@ H5VL_deltafs_get_group_index(H5VL_deltafs_item_t *item, const char *name,
                             size_t *index, hbool_t is_create)
 {
     H5VL_deltafs_file_t *file = item->file;
-    long long int gidx = (long long int)-1;
+    size_t gidx;
     herr_t ret_value = SUCCEED;
     
     FUNC_ENTER_NOAPI_NOINIT
@@ -1150,61 +1383,27 @@ H5VL_deltafs_get_group_index(H5VL_deltafs_item_t *item, const char *name,
         gidx = H5VL_DELTAFS_ROOT_GROUP_INDEX;
 
     } else {
-        if (sscanf(name, H5VL_DELTAFS_H5PART_GROUPNAME_STEP "#%lld", &gidx) != 1)
-            HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "unrecognized group name")
-
-        if (gidx < 0)
-            HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "invalid group name")
 
         if (is_create) {
-            if ((size_t)gidx != file->fmd.num_groups)
-                HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "group numbers should increase monotonically")
-            file->fmd.num_groups++;
+            gidx = file->fmd.num_groups++;
+            if (file->rank == 0 && H5VL_deltafs_store_group_name(file, name, gidx) < 0)
+                HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "couldn't store group name")
             file->dirty = true;
         } else {
-            if ((size_t)gidx >= file->fmd.num_groups)
+            if (H5VL_deltafs_read_group_index(file, name, &gidx) < 0)
                 HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "group not found")
+
+            if (gidx >= file->fmd.num_groups)
+                HGOTO_ERROR(H5E_ARGS, H5E_BADVALUE, FAIL, "invalid group in the metadata file")
         }
     }
 
-    *index = (size_t)gidx;
+    *index = gidx;
 
 done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5VL_deltafs_group_index() */
 
-/*-------------------------------------------------------------------------
- * Function:    H5VL_deltafs_get_group_name
- *
- * Purpose:     Given group index, returns the group name
- *
- * Return:      Success:        group name. Needs to be freed
- *              Failure:        error
- *
- * Programmer:  Saksham Jain
- *              March, 2018
- *
- *-------------------------------------------------------------------------
- */
-static char *
-H5VL_deltafs_get_group_name(size_t gidx)
-{
-    char *name;
-    char *ret_value = NULL;
-
-    FUNC_ENTER_NOAPI_NOINIT
-
-    /* TODO: Use a slab or reduce size of allocation */
-    if(NULL == (name = (char *)H5MM_malloc(HDF5_VOL_DELTAFS_MAX_NAME + 1)))
-        HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, NULL, "can't allocate buffer")
-
-    snprintf(name, HDF5_VOL_DELTAFS_MAX_NAME,
-            H5VL_DELTAFS_H5PART_GROUPNAME_STEP "#%lld", (long long int)gidx);
-    ret_value = name;
-
-done:
-    FUNC_LEAVE_NOAPI(ret_value)
-}
 
 /*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_group_create_helper
@@ -1390,6 +1589,7 @@ H5VL_deltafs_group_open(void *_item, H5VL_loc_params_t loc_params,
     void H5_ATTR_UNUSED **req)
 {
     H5VL_deltafs_item_t *item = (H5VL_deltafs_item_t *)_item;
+    H5VL_deltafs_file_t *file = item->file;
     H5VL_deltafs_group_t *grp = NULL;
     size_t gidx;
     void *ret_value = NULL;
@@ -1402,11 +1602,15 @@ H5VL_deltafs_group_open(void *_item, H5VL_loc_params_t loc_params,
     //if (gapl_id != H5P_DEFAULT /*|| dxpl_id != H5P_DEFAULT */)
     //    HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, NULL, "unsupported creation/transfer properties")
 
+    /* Can't open a group when file opened for writing */
+    if(file->flags & H5F_ACC_WRONLY)
+        HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, NULL, "can't open group in file opened for writing")
+
     /* Open using name parameter */
     if(H5VL_deltafs_get_group_index(item, name, &gidx, false) < 0)
         HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, NULL, "group name invalid")
 
-    if(NULL == (grp = H5VL_deltafs_group_open_helper(item->file, gidx)))
+    if(NULL == (grp = H5VL_deltafs_group_open_helper(file, gidx)))
         HGOTO_ERROR(H5E_SYM, H5E_BADITER, NULL, "can't open group")
 
     /* Set return value */
@@ -1437,7 +1641,7 @@ done:
  *
  *-------------------------------------------------------------------------
  */
-static void
+static int
 H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
                         size_t H5_ATTR_UNUSED keylen, const char *value,
                         size_t sz)
@@ -1447,18 +1651,19 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
     char *buf;
     size_t buf_size;
     size_t buf_index;
+    int ret_value = 0;
 
-    FUNC_ENTER_NOAPI_NOINIT_NOERR
+    FUNC_ENTER_NOAPI_NOINIT
 
     HDassert(grp->buf_filled_len <= grp->buf_size);
 
     /* TODO: This scanner API should change to allow failures to be returned */
     if (arg->fail == true)
-        return;
+        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, -1, "error occured")
 
     if (sz != arg->elem_size) {
         arg->fail = true;
-        return;
+        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, -1, "wrong size")
     }
 
     /* 
@@ -1477,7 +1682,7 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
 
         if(NULL == (buf = (char *)H5MM_realloc(grp->buf, buf_size))) {
             arg->fail = true;
-            return;
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, -1, "can't alloc")
         }
 
         grp->buf = buf;
@@ -1490,7 +1695,8 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
     
     grp->num_elems++;
 
-    FUNC_LEAVE_NOAPI_VOID
+done:    
+    FUNC_LEAVE_NOAPI(ret_value)
 }
 
 
@@ -1607,12 +1813,13 @@ H5VL_deltafs_group_write(H5VL_deltafs_group_t *grp)
     size_t i, j;
     size_t voffset, boffset, keyoff, keysize;
     hsize_t dsets_size[HDF5_VOL_DELTAFS_MAX_DATASET];
+    char fname[PATH_MAX];
     char *value = NULL;
+    uint64_t tag;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
 
-    HDassert(file->handle != NULL);
     HDassert(grp->dirty == true);
     HDassert(file->flags & H5F_ACC_WRONLY);
     HDassert(grp->num_datasets != 0);
@@ -1631,6 +1838,12 @@ H5VL_deltafs_group_write(H5VL_deltafs_group_t *grp)
     if(NULL == (value = (char *)H5MM_malloc(elem_size)))
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't allocate space for buffer")
 
+    deltafs_preload_start_epoch();
+
+    /* TODO: Check if this barrier is needed? */
+    if (MPI_Barrier(MPI_COMM_WORLD) != MPI_SUCCESS)
+        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "MPI Barrier failed")
+
     for (i = 0; i < grp->num_elems; i++) {
         for (j = 0, voffset = 0, boffset = 0; j < grp->num_datasets; j++) {
             size_t len = dsets_size[j];
@@ -1644,13 +1857,29 @@ H5VL_deltafs_group_write(H5VL_deltafs_group_t *grp)
         keysize = dsets_size[0];
         keyoff = keysize * i;
 
-        if (deltafs_plfsdir_put(file->handle, &grp->buf[keyoff], keysize,
-                                (int)grp->index, value, elem_size) < 0)
+        switch (keysize) {
+        case 1:
+            tag = *((uint8_t *)&grp->buf[keyoff]);
+            break;
+        case 2:
+            tag = *((uint16_t *)&grp->buf[keyoff]);
+            break;
+        case 4:
+            tag = *((uint32_t *)&grp->buf[keyoff]);
+            break;
+        case 8:
+            tag = *((uint64_t *)&grp->buf[keyoff]);
+            break;
+        default:
+            assert(0 && "Unknown size of tag");
+        }
+        
+        snprintf(fname, sizeof(fname), "%s/%" PRIu64, file->name, tag);
+        if (deltafs_preload_write(fname, value, elem_size) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't write to deltafs file")
     }
 
-    if (deltafs_plfsdir_epoch_flush(file->handle, (int)grp->index) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't flush deltafs file")
+    deltafs_preload_flush_epoch();
 
 done:
     H5MM_xfree(value);
@@ -2180,13 +2409,22 @@ H5VL_deltafs_xfer(void *_dest_buf, H5S_t *dest_space, size_t dest_type_size,
     do {
         /* Get the sequences of bytes */
         if(src_i == src_nseq) {
-                src_i = 0; 
-                if (H5S_SELECT_GET_SEQ_LIST(src_space, 0, &src_sel_iter,
+            src_i = 0;
+            
+            /* TODO: Find the correct way to handle this */
+            if (src_sel_iter.elmt_left == 0)
+                break;
+
+            if (H5S_SELECT_GET_SEQ_LIST(src_space, 0, &src_sel_iter,
                     (size_t)H5VL_DELTAFS_SEQ_LIST_LEN, (size_t)-1, &src_nseq, &src_nelem, src_off, src_len) < 0)
-                    HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
+                HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
         }
         if(dest_i == dest_nseq) {
             dest_i = 0;
+
+            if (dest_sel_iter.elmt_left == 0)
+                break;
+
             if (H5S_SELECT_GET_SEQ_LIST(dest_space, 0, &dest_sel_iter,
                     (size_t)H5VL_DELTAFS_SEQ_LIST_LEN, (size_t)-1, &dest_nseq, &dest_nelem, dest_off, dest_len) < 0)
                 HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
@@ -2614,20 +2852,20 @@ H5VL_deltafs_link_specific(void *_item, H5VL_loc_params_t loc_params,
 
                 HDassert(H5VL_OBJECT_BY_NAME == loc_params.type);
 
-    		/* 
-	    	 * If item is file, links can be only groups.
-		     * If item is groups, links can be only datasets
-    		 */
-    		if (item->type == H5I_FILE || H5VL_deltafs_is_root_group(item)) {
-	    		if(H5VL_deltafs_get_group_index(item, loc_params.loc_data.loc_by_name.name, &gidx, false) < 0)
-          			HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "group name invalid")
-    		} else if (item->type == H5I_GROUP) {
-	    		 if (H5VL_deltafs_get_dataset_index(item, loc_params.loc_data.loc_by_name.name, 
-                                                    0, &didx, false) < 0)
-        			HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "dataset name invalid")
-    		} else {
-	    		HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "invalid item")
-		    }
+                /* 
+                * If item is file, links can be only groups.
+                * If item is groups, links can be only datasets
+                */
+                if (item->type == H5I_FILE || H5VL_deltafs_is_root_group(item)) {
+                    if(H5VL_deltafs_get_group_index(item, loc_params.loc_data.loc_by_name.name, &gidx, false) < 0)
+                        HGOTO_ERROR(H5E_SYM, H5E_BADVALUE, FAIL, "group name invalid")
+                } else if (item->type == H5I_GROUP) {
+                    if (H5VL_deltafs_get_dataset_index(item, loc_params.loc_data.loc_by_name.name, 
+                                                        0, &didx, false) < 0)
+                        HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "dataset name invalid")
+                } else {
+                    HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "invalid item")
+                }
 
                 *lexists_ret = 1;
 
@@ -2703,7 +2941,7 @@ H5VL_deltafs_link_specific(void *_item, H5VL_loc_params_t loc_params,
                         (inc == true) ? i++: i--) {
 		        
     		        if (isFile) {
-        	    		p =  H5VL_deltafs_get_group_name((size_t)i);
+        	    		p =  H5VL_deltafs_read_group_name(file, (size_t)i);
     	    	    } else {
 	    	            p = file->fmd.dmd[i].name;
 		            }

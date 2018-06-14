@@ -25,6 +25,7 @@
 
 /* Private headers needed by this file */
 #include "H5private.h"		/* Generic Functions			*/
+#include "H5VLprivate.h"
 
 /**************************/
 /* Library Private Macros */
@@ -210,5 +211,8 @@ H5_DLL herr_t H5P_get_fill_value(H5P_genplist_t *plist, const struct H5T_t *type
 
 H5_DLL int H5P_ignore_cmp(const void H5_ATTR_UNUSED *val1, const void H5_ATTR_UNUSED *val2,
     size_t H5_ATTR_UNUSED size);
+
+
+H5_DLL herr_t H5Pget_default_VOL_prop(H5VL_plugin_prop_t *prop);
 #endif /* _H5Pprivate_H */
 

@@ -32,6 +32,8 @@
 #include "H5VLprivate.h"	/* VOL plugins				*/
 
 
+#include "deltafs_preload.h"
+
 /****************/
 /* Local Macros */
 /****************/
@@ -597,8 +599,14 @@ H5Fcreate(const char *filename, unsigned flags, hid_t fcpl_id, hid_t fapl_id)
     if(NULL == (plist = (H5P_genplist_t *)H5I_object(fapl_id)))
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file access property list")
 
-    if(H5P_peek(plist, H5F_ACS_VOL_NAME, &plugin_prop) < 0)
-        HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "can't get vol plugin info")
+    /* Use default VOL incase the file doesn't lie within the plfsdir */
+    if (deltafs_preload_under_plfsdir(filename)) {
+        if(H5P_peek(plist, H5F_ACS_VOL_NAME, &plugin_prop) < 0)
+            HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "can't get vol plugin info")
+    } else {
+        if (H5Pget_default_VOL_prop(&plugin_prop) < 0)
+             HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "can't get vol plugin info")
+    }
 
     if(NULL == (vol_cls = (H5VL_class_t *)H5I_object_verify(plugin_prop.plugin_id, H5I_VOL)))
         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a VOL plugin ID")
@@ -693,7 +701,7 @@ H5Fopen(const char *filename, unsigned flags, hid_t fapl_id)
 
     /* get the VOL info from the fapl */
     if(NULL == (plist = (H5P_genplist_t *)H5I_object(fapl_id)))
-        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file access property list")
+        HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "not a file access property list") 
     if(H5P_peek(plist, H5F_ACS_VOL_NAME, &plugin_prop) < 0)
         HGOTO_ERROR(H5E_PLIST, H5E_CANTGET, FAIL, "can't get vol plugin info")
 
