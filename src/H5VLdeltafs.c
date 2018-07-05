@@ -40,9 +40,6 @@
 #define H5VL_DELTAFS_FMD_TOTAL_RANK             "__total_rank"
 #define HDF5_DELATFS_FILE_MAGIC_NUMBER          "AA55AA55"
 
-/* Units (in bytes) in which to increment buffer */
-#define H5VL_DELTAFS_BUF_SIZE_INC               4096
-
 /* 
  * TODO: File data and group data have constant limitations.
  * Solve these
@@ -420,9 +417,6 @@ H5VL_deltafs_file_insert(H5VL_deltafs_file_t *file)
     
     FUNC_ENTER_NOAPI_NOINIT_NOERR
 
-    HDassert(H5VL_DELTAFS_IS_EMPTY(H5VL_DELTAFS_fhead) && 
-            "Currently H5VL deltafs only supports one file");
-
     H5VL_DELTAFS_LADD_TAIL(H5VL_DELTAFS_fhead, file);
     file->obj.item.rc++;
 
@@ -482,6 +476,10 @@ H5VL_deltafs_file_find(const char *name, unsigned flags, H5VL_deltafs_file_t **f
             if ((file->flags & H5F_ACC_WRONLY) != (flags & H5F_ACC_WRONLY))
                 HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can open file for read or write only")
 
+            if (flags & H5F_ACC_WRONLY)
+                if (deltafs_preload_change_cur_plfsdir_dir(name) < 0)
+                    HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't change current file");
+
             /* Increase ref count */
             file->obj.item.rc++;
             *filp = file;
@@ -512,15 +510,19 @@ H5VL_deltafs_open_fmd_handle(H5VL_deltafs_file_t *file)
 {
     deltafs_plfsdir_t *handle = NULL;
     char fname[PATH_MAX];
+    char rpath[PATH_MAX];
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
+
+    snprintf(fname, sizeof(fname), "%s/%s", file->name, HDF5_VOL_DELTAFS_MD_FNAME);
 
     /* Only rank 0 is allowed to operate on the fmd handle */
     HDassert(file->rank == 0);
 
     if ((file->flags & H5F_ACC_WRONLY) == H5F_ACC_WRONLY) {
-       if (deltafs_preload_append_to_plfdir_local_root(HDF5_VOL_DELTAFS_MD_FNAME, fname, sizeof(fname)) < 0)
+
+       if (deltafs_preload_append_to_plfdir_local_root(fname, rpath, sizeof(rpath)) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "invalid local root");
 
         if ((handle = deltafs_plfsdir_create_handle("", O_WRONLY, 0)) == NULL)
@@ -529,7 +531,7 @@ H5VL_deltafs_open_fmd_handle(H5VL_deltafs_file_t *file)
         if (deltafs_plfsdir_set_rank(handle, 0) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't set rank in deltafs handle")
  
-        if (deltafs_plfsdir_open(handle, fname) < 0)
+        if (deltafs_plfsdir_open(handle, rpath) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open rank 0 file")
 
     } else {
@@ -543,7 +545,7 @@ H5VL_deltafs_open_fmd_handle(H5VL_deltafs_file_t *file)
         /* Rank 0 has all the metadata */
         if (deltafs_plfsdir_set_rank(handle, 0) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't set rank in deltafs handle")
- 
+
         if (deltafs_plfsdir_open(handle, fname) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open rank 0 file")
 
@@ -826,7 +828,15 @@ H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, const char *name,
     file->fmd_handle = NULL;
     file->rank = rank;
     file->max_grp_buf_size = 0;
-    
+   
+    if ((flags & H5F_ACC_WRONLY) == H5F_ACC_WRONLY) {
+        if (deltafs_preload_init_plfsdir_dir(file->name) < 0)
+           HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't open file");
+
+        if (deltafs_preload_change_cur_plfsdir_dir(file->name) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't change current file");
+    }
+
     if (rank == 0 && H5VL_deltafs_open_fmd_handle(file) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open metadata file")
 
@@ -1324,8 +1334,9 @@ H5VL_deltafs_read_group_index(H5VL_deltafs_file_t *file, const char *name, size_
 
     snprintf(sname, sizeof(sname), "%s:%s", H5VL_DELTAFS_FMD_GROUP_NAME_KEY, name);
 
+    /* XXX: This function is not returning NULL when key is not found */
     if ((value = (char *)deltafs_plfsdir_read(file->fmd_handle, sname, -1,
-                                &size, NULL, NULL)) == NULL)
+                                &size, NULL, NULL)) == NULL || size != strlen(value) + 1)
         HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't get group index")
 
     /* TODO: Do more error checks */
@@ -1447,6 +1458,7 @@ H5VL_deltafs_group_create_helper(H5VL_deltafs_item_t *item, const char *name)
     grp->buf = NULL;
     grp->buf_filled_len = 0;
     grp->buf_size = 0;
+    grp->is_num_elem_found = false;
     grp->is_read = false;
     grp->dirty = true;
 
@@ -1555,6 +1567,7 @@ H5VL_deltafs_group_open_helper(H5VL_deltafs_file_t *file, size_t index)
     grp->buf = NULL;
     grp->buf_filled_len = 0;
     grp->buf_size = 0;
+    grp->is_num_elem_found = false;
     grp->is_read = false;
     grp->dirty = false;
 
@@ -1628,6 +1641,72 @@ done:
     FUNC_LEAVE_NOAPI(ret_value)
 } /* end H5VL_deltafs_group_open() */
 
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_group_find_num_elems
+ *
+ * Purpose:     Finds out all the number of elements in a group.
+ *
+ * Return:      Success:        SUCCESS
+ *              Failure:        FAIL
+ *
+ * Programmer:  Saksham Jain
+ *              June, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_group_find_num_elems(H5VL_deltafs_group_t *grp)
+{
+    H5VL_deltafs_file_t *file = grp->obj.item.file;
+    deltafs_plfsdir_t *handle = NULL;
+    size_t i;
+    ssize_t num_keys;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    HDassert(grp->is_num_elem_found == false);
+    HDassert(grp->is_read == false);
+    HDassert(grp->buf == NULL);
+    HDassert(grp->buf_size == 0);
+    HDassert(grp->num_elems == 0);
+    HDassert(!(file->flags & H5F_ACC_WRONLY));
+
+    /* Scan all rank files for dataset's data */
+    for (i = 0; i < file->fmd.total_ranks; i++) {
+        
+        if ((handle = deltafs_plfsdir_create_handle("", O_RDONLY, 0)) == NULL)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't create deltafs handle")
+
+        if (deltafs_plfsdir_set_rank(handle, (int)(i)) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't set rank in deltafs handle")
+ 
+        if (deltafs_plfsdir_open(handle, file->name) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open file")
+
+        if ((num_keys = deltafs_plfsdir_count(handle, (int)grp->index)) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't count keys in groups")
+
+        grp->num_elems += (long unsigned int)num_keys;
+
+        if (deltafs_plfsdir_free_handle(handle) < 0)
+            HDONE_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
+
+        handle = NULL;
+    }
+
+    grp->is_num_elem_found = true;
+
+done:
+    if (handle != NULL) {
+        if (deltafs_plfsdir_free_handle(handle) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
+    }
+
+    
+    FUNC_LEAVE_NOAPI(ret_value)
+}
 
 
 /*-------------------------------------------------------------------------
@@ -1648,8 +1727,6 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
 {
     H5VL_deltafs_cb_arg_t *arg = (H5VL_deltafs_cb_arg_t *)_arg;
     H5VL_deltafs_group_t *grp = arg->grp;
-    char *buf;
-    size_t buf_size;
     size_t buf_index;
     int ret_value = 0;
 
@@ -1672,30 +1749,19 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
      */
 
     /* Key is not important as tag is used as key and it is part of value */
+    
     if (grp->buf_size < grp->buf_filled_len + sz) {
-   
-        /* TODO: Make this O(1) */
-        buf_size = grp->buf_size;
-        while (buf_size <  grp->buf_filled_len + sz) {
-            buf_size += H5VL_DELTAFS_BUF_SIZE_INC;
-        }
-
-        if(NULL == (buf = (char *)H5MM_realloc(grp->buf, buf_size))) {
-            arg->fail = true;
-            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, -1, "can't alloc")
-        }
-
-        grp->buf = buf;
-        grp->buf_size = buf_size;
+        arg->fail = true;
+        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, -1, "buffer overflow")
     }
 
     buf_index = grp->buf_filled_len;
     memcpy(&grp->buf[buf_index], value, sz);
     grp->buf_filled_len += sz;
     
-    grp->num_elems++;
-
-done:    
+done:
+    if (ret_value != SUCCEED)
+        ret_value = -1;
     FUNC_LEAVE_NOAPI(ret_value)
 }
 
@@ -1719,7 +1785,9 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
     H5VL_deltafs_file_t *file = grp->obj.item.file;
     deltafs_plfsdir_t *handle = NULL;
     size_t i;
+    size_t buf_size;
     H5VL_deltafs_cb_arg_t arg;
+    double start, total;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -1727,22 +1795,21 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
     HDassert(grp->is_read == false);
     HDassert(grp->buf == NULL);
     HDassert(grp->buf_size == 0);
-    HDassert(grp->num_elems == 0);
     HDassert(!(file->flags & H5F_ACC_WRONLY));
 
     arg.grp = grp;
     if (H5VL_deltafs_get_elem_size(file, &arg.elem_size, NULL) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't get elem size")
 
-    /*
-     * We allocate the maximum buffer size we have seen in past
-     * This ensures less calling of realloc
-     */
-    if (file->max_grp_buf_size != 0) {
-        if(NULL == (grp->buf = (char *)H5MM_malloc(file->max_grp_buf_size)))
-            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't allocate space for buffer")
-        grp->buf_size = file->max_grp_buf_size;
-    }
+    if (grp->is_num_elem_found == 0 && H5VL_deltafs_group_find_num_elems(grp) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't find number of elements in group")
+
+    buf_size = grp->num_elems * arg.elem_size;
+    
+    /* During read, we know the exact amount of memory needed */
+    if(NULL == (grp->buf = (char *)H5MM_malloc(buf_size)))
+        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't allocate space for buffer")
+    grp->buf_size = buf_size;
 
 
     /* Scan all rank files for dataset's data */
@@ -1757,6 +1824,7 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
         if (deltafs_plfsdir_open(handle, file->name) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open file")
 
+        start = MPI_Wtime();
         arg.fail = false;
         if (deltafs_plfsdir_scan(handle, (int)grp->index,
                                             H5VL_deltafs_group_scanner,
@@ -1765,6 +1833,9 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
 
         if (arg.fail == true)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't read file")
+
+        total = MPI_Wtime() - start;
+        printf("HDF5_Scanner:Rank:%d, FileRank:%zu, Time:%f\n", file->rank, i, total);
 
         if (deltafs_plfsdir_free_handle(handle) < 0)
             HDONE_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
@@ -2501,8 +2572,9 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     H5S_t *mem_space = NULL;
     hsize_t type_size;
     size_t i;
-    hsize_t len, offset, elem_size, num_elems;
+    hsize_t len, offset, elem_size, num_elems, count;
     hsize_t dsets_size[HDF5_VOL_DELTAFS_MAX_DATASET];
+    double start_time, total_time;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -2529,9 +2601,6 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     num_elems = grp->num_elems;
     len = grp->num_elems * elem_size;
 
-    if((real_file_space_id = H5Screate_simple (1, &len, NULL)) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't create dataspace")
-
     if(mem_space_id == H5S_ALL) {
         if((real_mem_space_id = H5Screate_simple(1, &num_elems, NULL)) < 0)
             HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't create dataspace")
@@ -2542,9 +2611,35 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     for (i = 0, offset = 0; i < dset->index; i++)
         offset += dsets_size[i];
 
-    if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &offset,
-			                    &elem_size, &num_elems, &dsets_size[dset->index]) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't select dataspace")
+    if((real_file_space_id = H5Screate_simple (1, &len, NULL)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't create dataspace")
+
+    if (file_space_id == H5S_ALL) {
+        count = num_elems;
+        if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &offset,
+	    		                    &elem_size, &count, &dsets_size[dset->index]) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't select dataspace")
+    } else {
+        int ndims;
+        hsize_t start, end;
+
+        if((ndims = H5Sget_simple_extent_ndims(file_space_id)) < 0)
+            HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "can't get number of dimensions")
+
+        if (ndims != 1)
+            HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "incorrect number of dimensions")
+
+        if (H5Sget_select_bounds(file_space_id, &start, &end ) < 0)
+            HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "can't get bounding box")
+
+        count = end - start + 1;
+        
+        offset += elem_size * start;
+
+        if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &offset,
+	    		                    &elem_size, &count, &dsets_size[dset->index]) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't select dataspace")
+    }
 
     /* Get file dataspace object */
     if(NULL == (file_space = (H5S_t *)H5I_object(real_file_space_id)))
@@ -2556,11 +2651,14 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     if (grp->is_read == false && H5VL_deltafs_group_read_all(grp) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't read group data")
 
+    start_time = MPI_Wtime();
     /* Transfer from dset buf to buffer */
     if(H5VL_deltafs_xfer((void *)buf, mem_space, type_size,
-                (void *)grp->buf, file_space, 1, num_elems * type_size) < 0)
+                (void *)grp->buf, file_space, 1, count * type_size) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't read from memory")
 
+    total_time = MPI_Wtime() - start_time;
+    printf("HDF5_ReadXfer:Rank:%d, Time:%f\n", file->rank, total_time);
 done:
     if (real_file_space_id > 0 && H5Sclose(real_file_space_id ) < 0)
         HDONE_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't close dataspace")
@@ -2638,6 +2736,8 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     /* Expand group if it is not sufficiently large */
     if (grp->buf_size - grp->buf_filled_len < len) {
         buf_size = grp->buf_filled_len + len;
+        buf_size = buf_size > file->max_grp_buf_size ? buf_size : file->max_grp_buf_size;
+
         if(NULL == (gbuf = (char *)H5MM_realloc(grp->buf, buf_size)))
             HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "can't allocate buffer for serialized datatype")
 
@@ -2710,7 +2810,7 @@ H5VL_deltafs_dataset_get(void *_dset, H5VL_dataset_get_t get_type,
                 hid_t *ret_id = va_arg(arguments, hid_t *);
                 H5VL_deltafs_group_t *grp = dset->parent_grp;
 
-                if (grp->is_read == false && H5VL_deltafs_group_read_all(grp) < 0)
+                if (grp->is_num_elem_found == false && H5VL_deltafs_group_find_num_elems(grp) < 0)
                     HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't read group data")
 
                 /* We only support query for dataspace when reading */

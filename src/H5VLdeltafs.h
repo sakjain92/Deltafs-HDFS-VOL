@@ -75,6 +75,7 @@ typedef struct H5VL_deltafs_group_t {
     char *buf;
     size_t buf_filled_len;                  /* How much has buffer been written */
     size_t buf_size;
+    hbool_t is_num_elem_found;              /* Has number of element been found */
     hbool_t is_read;                        /* Has group buffer been read ? */
     hbool_t dirty;
 
