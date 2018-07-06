@@ -243,13 +243,16 @@ H5VL_deltafs_init(void)
 {
     void *p;
     herr_t ret_value = SUCCEED;            /* Return value */
+    double start;
 
     FUNC_ENTER_NOAPI(FAIL)
 
     if (H5VL_deltafs_is_write_enabled()) {
 
+        start = MPI_Wtime();
         deltafs_preload_early_init();
         deltafs_preload_late_init(MPI_COMM_WORLD);
+        printf("HDF5:Init:Time:%f\n", MPI_Wtime() - start);
 
         /* As read path only supports plfsdir currently */
         if (!deltafs_preload_plfsdir_enabled())
@@ -595,6 +598,10 @@ H5VL_deltafs_read_fmd(H5VL_deltafs_file_t *file)
 
     FUNC_ENTER_NOAPI_NOINIT
 
+    double start, stop;
+
+    start = MPI_Wtime();
+
     /* Get magic number */
     if ((value = (char *)deltafs_plfsdir_read(handle,
                     H5VL_DELTAFS_FMD_MAGIC_NUMBER_KEY, -1,
@@ -693,6 +700,9 @@ H5VL_deltafs_read_fmd(H5VL_deltafs_file_t *file)
         
         dmd->is_initialized = true;
     }
+
+    stop = MPI_Wtime() - start;
+    printf("HDF5_Scanner:ReadingFMD:Rank:%d, Time:%f\n", file->rank, stop);
 
 done:
     free(value);
@@ -1458,7 +1468,6 @@ H5VL_deltafs_group_create_helper(H5VL_deltafs_item_t *item, const char *name)
     grp->buf = NULL;
     grp->buf_filled_len = 0;
     grp->buf_size = 0;
-    grp->is_num_elem_found = false;
     grp->is_read = false;
     grp->dirty = true;
 
@@ -1567,7 +1576,6 @@ H5VL_deltafs_group_open_helper(H5VL_deltafs_file_t *file, size_t index)
     grp->buf = NULL;
     grp->buf_filled_len = 0;
     grp->buf_size = 0;
-    grp->is_num_elem_found = false;
     grp->is_read = false;
     grp->dirty = false;
 
@@ -1643,73 +1651,6 @@ done:
 
 
 /*-------------------------------------------------------------------------
- * Function:    H5VL_deltafs_group_find_num_elems
- *
- * Purpose:     Finds out all the number of elements in a group.
- *
- * Return:      Success:        SUCCESS
- *              Failure:        FAIL
- *
- * Programmer:  Saksham Jain
- *              June, 2018
- *
- *-------------------------------------------------------------------------
- */
-static herr_t
-H5VL_deltafs_group_find_num_elems(H5VL_deltafs_group_t *grp)
-{
-    H5VL_deltafs_file_t *file = grp->obj.item.file;
-    deltafs_plfsdir_t *handle = NULL;
-    size_t i;
-    ssize_t num_keys;
-    herr_t ret_value = SUCCEED;
-
-    FUNC_ENTER_NOAPI_NOINIT
-
-    HDassert(grp->is_num_elem_found == false);
-    HDassert(grp->is_read == false);
-    HDassert(grp->buf == NULL);
-    HDassert(grp->buf_size == 0);
-    HDassert(grp->num_elems == 0);
-    HDassert(!(file->flags & H5F_ACC_WRONLY));
-
-    /* Scan all rank files for dataset's data */
-    for (i = 0; i < file->fmd.total_ranks; i++) {
-        
-        if ((handle = deltafs_plfsdir_create_handle("", O_RDONLY, 0)) == NULL)
-            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't create deltafs handle")
-
-        if (deltafs_plfsdir_set_rank(handle, (int)(i)) < 0)
-            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't set rank in deltafs handle")
- 
-        if (deltafs_plfsdir_open(handle, file->name) < 0)
-            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open file")
-
-        if ((num_keys = deltafs_plfsdir_count(handle, (int)grp->index)) < 0)
-            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't count keys in groups")
-
-        grp->num_elems += (long unsigned int)num_keys;
-
-        if (deltafs_plfsdir_free_handle(handle) < 0)
-            HDONE_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
-
-        handle = NULL;
-    }
-
-    grp->is_num_elem_found = true;
-
-done:
-    if (handle != NULL) {
-        if (deltafs_plfsdir_free_handle(handle) < 0)
-            HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
-    }
-
-    
-    FUNC_LEAVE_NOAPI(ret_value)
-}
-
-
-/*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_group_scan
  *
  * Purpose:     Reads in all the values of elements in one file and stores
@@ -1759,9 +1700,75 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
     memcpy(&grp->buf[buf_index], value, sz);
     grp->buf_filled_len += sz;
     
+    arg->count++;
+
 done:
     if (ret_value != SUCCEED)
         ret_value = -1;
+    FUNC_LEAVE_NOAPI(ret_value)
+}
+
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_group_find_max_num_elems
+ *
+ * Purpose:     Finds out all the upper limit on number of elements in a group.
+ *
+ * Return:      Success:        SUCCESS
+ *              Failure:        FAIL
+ *
+ * Programmer:  Saksham Jain
+ *              June, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_group_find_max_num_elems(H5VL_deltafs_group_t *grp, 
+        hsize_t elem_size, hsize_t *max_num_elems)
+{
+    H5VL_deltafs_file_t *file = grp->obj.item.file;
+    struct dirent *dp;
+    DIR *dfd = NULL;
+    hsize_t sz = 0;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    HDassert(!(file->flags & H5F_ACC_WRONLY));
+
+    if ((dfd = opendir(file->name)) == NULL)
+        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open file")
+
+    while ((dp = readdir(dfd)) != NULL) {
+        
+        struct stat stbuf;
+        hsize_t len = strlen(dp->d_name);
+        char fname[PATH_MAX];
+
+        if (S_ISDIR(stbuf.st_mode) || len < 4)
+            continue;
+
+        if (strcmp(&dp->d_name[len - 4], ".dat"))
+            continue;
+
+        snprintf(fname, sizeof(fname), "%s/%s",file->name, dp->d_name);
+
+        if(stat(fname, &stbuf ) == -1 )
+            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't stat file")
+
+        sz += (hsize_t)stbuf.st_size;
+    }
+
+    assert(file->fmd.num_groups != 0);
+
+    *max_num_elems = sz / elem_size / file->fmd.num_groups;
+
+    printf("SZ:%lld, Epoch:%ld, Final:%lld\n", sz, file->fmd.num_groups, *max_num_elems);
+
+done:
+    if (dfd && closedir(dfd) < 0)
+        HDONE_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't close file")
+
     FUNC_LEAVE_NOAPI(ret_value)
 }
 
@@ -1787,7 +1794,8 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
     size_t i;
     size_t buf_size;
     H5VL_deltafs_cb_arg_t arg;
-    double start, total;
+    double start, total, sub_start, sub_total;
+    hsize_t max_num_elems;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -1798,23 +1806,25 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
     HDassert(!(file->flags & H5F_ACC_WRONLY));
 
     arg.grp = grp;
+    arg.count = 0;
     if (H5VL_deltafs_get_elem_size(file, &arg.elem_size, NULL) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't get elem size")
 
-    if (grp->is_num_elem_found == 0 && H5VL_deltafs_group_find_num_elems(grp) < 0)
+    if (H5VL_deltafs_group_find_max_num_elems(grp, arg.elem_size, &max_num_elems) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't find number of elements in group")
 
-    buf_size = grp->num_elems * arg.elem_size;
+    buf_size = max_num_elems * arg.elem_size;
     
     /* During read, we know the exact amount of memory needed */
     if(NULL == (grp->buf = (char *)H5MM_malloc(buf_size)))
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't allocate space for buffer")
     grp->buf_size = buf_size;
 
-
+    start = MPI_Wtime();
     /* Scan all rank files for dataset's data */
     for (i = 0; i < file->fmd.total_ranks; i++) {
         
+        sub_start = MPI_Wtime();
         if ((handle = deltafs_plfsdir_create_handle("", O_RDONLY, 0)) == NULL)
             HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't create deltafs handle")
 
@@ -1823,8 +1833,11 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
  
         if (deltafs_plfsdir_open(handle, file->name) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't open file")
+        
+        sub_total = MPI_Wtime() - sub_start;
+        printf("HDF5_Scanner:SubTimeOpening:Rank:%d, FileRank:%zu, Time:%f\n", file->rank, i, sub_total);
 
-        start = MPI_Wtime();
+        sub_start = MPI_Wtime();
         arg.fail = false;
         if (deltafs_plfsdir_scan(handle, (int)grp->index,
                                             H5VL_deltafs_group_scanner,
@@ -1834,18 +1847,22 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
         if (arg.fail == true)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't read file")
 
-        total = MPI_Wtime() - start;
-        printf("HDF5_Scanner:Rank:%d, FileRank:%zu, Time:%f\n", file->rank, i, total);
+        sub_total = MPI_Wtime() - sub_start;
+        printf("HDF5_Scanner:SubTimeScanning:Rank:%d, FileRank:%zu, Time:%f\n", file->rank, i, sub_total);
 
         if (deltafs_plfsdir_free_handle(handle) < 0)
             HDONE_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
 
         handle = NULL;
     }
+    total = MPI_Wtime() - start;
+    printf("HDF5_Scanner:TotalTime:Rank:%d, Time:%f\n", file->rank, total);
 
     grp->is_read = true;
     if (grp->buf_size > file->max_grp_buf_size)
         file->max_grp_buf_size = grp->buf_size;
+
+    grp->num_elems = arg.count;
 
 done:
     if (handle != NULL) {
@@ -2597,6 +2614,9 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     if (H5VL_deltafs_get_elem_size(file, &elem_size, dsets_size) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't get elem size")
 
+    if (grp->is_read == false && H5VL_deltafs_group_read_all(grp) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't read group data")
+
     HDassert(grp->num_elems != 0);
     num_elems = grp->num_elems;
     len = grp->num_elems * elem_size;
@@ -2810,12 +2830,12 @@ H5VL_deltafs_dataset_get(void *_dset, H5VL_dataset_get_t get_type,
                 hid_t *ret_id = va_arg(arguments, hid_t *);
                 H5VL_deltafs_group_t *grp = dset->parent_grp;
 
-                if (grp->is_num_elem_found == false && H5VL_deltafs_group_find_num_elems(grp) < 0)
-                    HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't read group data")
-
                 /* We only support query for dataspace when reading */
                 if ((file->flags & H5F_ACC_WRONLY) != 0)
                     HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get dataspace when file open for write");
+
+                if (grp->is_read == false && H5VL_deltafs_group_read_all(grp) < 0)
+                    HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't read group data")
 
                 num_elems = grp->num_elems;
                 if((*ret_id = H5Screate_simple (1, &num_elems, NULL)) < 0)
