@@ -7,6 +7,7 @@
  */
 
 #define H5O_FRIEND              /* Suppress error about including H5Opkg */
+#define H5S_FRIEND
 
 #include "H5public.h"
 #include "H5private.h"
@@ -21,13 +22,13 @@
 #include "H5Pprivate.h"         /* Property lists                       */
 #include "H5Sprivate.h"         /* Dataspaces                           */
 #include "H5Opkg.h"
+#include "H5Spkg.h"
 
 #include "deltafs_api.h"
 #include "deltafs_preload.h"
 
 #define H5VL_DELTAFS_ENABLE_ENV                 "HDF5_DELTAFS_ENABLE"
 #define H5VL_DELTAFS_WRITE_ENABLE_ENV           "HDF5_DELTAFS_WRITE_ENABLE"
-#define H5VL_DELTAFS_SEQ_LIST_LEN               64
 #define H5VL_DELTAFS_ROOT_GROUP_INDEX           ((size_t)(LONG_MAX))
 
 #define H5VL_DELTAFS_FMD_NUM_GROUP_KEY          "__num_groups"
@@ -827,7 +828,6 @@ H5VL_deltafs_file_struct_init(H5VL_deltafs_file_t *file, const char *name,
     file->flags = flags;
     file->fmd_handle = NULL;
     file->rank = rank;
-    file->max_grp_buf_size = 0;
    
     if ((flags & H5F_ACC_WRONLY) == H5F_ACC_WRONLY) {
         if (deltafs_preload_init_plfsdir_dir(file->name) < 0)
@@ -1455,9 +1455,6 @@ H5VL_deltafs_group_create_helper(H5VL_deltafs_item_t *item, const char *name)
     grp->index = index;
     grp->num_datasets = 0;
     grp->num_elems = 0;
-    grp->buf = NULL;
-    grp->buf_filled_len = 0;
-    grp->buf_size = 0;
     grp->is_num_elem_found = false;
     grp->is_read = false;
     grp->dirty = true;
@@ -1564,9 +1561,6 @@ H5VL_deltafs_group_open_helper(H5VL_deltafs_file_t *file, size_t index)
     HDassert(grp->num_datasets != 0);
 
     grp->num_elems = 0;
-    grp->buf = NULL;
-    grp->buf_filled_len = 0;
-    grp->buf_size = 0;
     grp->is_num_elem_found = false;
     grp->is_read = false;
     grp->dirty = false;
@@ -1667,10 +1661,6 @@ H5VL_deltafs_group_find_num_elems(H5VL_deltafs_group_t *grp)
     FUNC_ENTER_NOAPI_NOINIT
 
     HDassert(grp->is_num_elem_found == false);
-    HDassert(grp->is_read == false);
-    HDassert(grp->buf == NULL);
-    HDassert(grp->buf_size == 0);
-    HDassert(grp->num_elems == 0);
     HDassert(!(file->flags & H5F_ACC_WRONLY));
 
     /* Scan all rank files for dataset's data */
@@ -1727,12 +1717,13 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
 {
     H5VL_deltafs_cb_arg_t *arg = (H5VL_deltafs_cb_arg_t *)_arg;
     H5VL_deltafs_group_t *grp = arg->grp;
-    size_t buf_index;
+    size_t i;
+    hsize_t count = arg->count;
     int ret_value = 0;
 
     FUNC_ENTER_NOAPI_NOINIT
 
-    HDassert(grp->buf_filled_len <= grp->buf_size);
+    /* Key is not important as tag is used as key and it is part of value */
 
     /* TODO: This scanner API should change to allow failures to be returned */
     if (arg->fail == true)
@@ -1748,17 +1739,21 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
      * duplicate in the value
      */
 
-    /* Key is not important as tag is used as key and it is part of value */
-    
-    if (grp->buf_size < grp->buf_filled_len + sz) {
-        arg->fail = true;
-        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, -1, "buffer overflow")
+    /* TODO: If buffers are contiguous in memory, this can be optimized */
+    for (i = 0; i < grp->num_datasets; i++) {
+        H5VL_deltafs_dset_t *dset = grp->dsets[i];
+        if (!dset)
+            continue;
+        if (count >= dset->file_start && count <= dset->file_end) {
+            char *buf = (char *)dset->buf;
+            memcpy(&buf[dset->mem_cur_offset], &value[arg->dsets_off[i]],
+                    arg->dsets_size[i]);
+            dset->mem_cur_offset += dset->mem_dims.stride * arg->dsets_size[i];
+        }
     }
-
-    buf_index = grp->buf_filled_len;
-    memcpy(&grp->buf[buf_index], value, sz);
-    grp->buf_filled_len += sz;
     
+    arg->count++;
+
 done:
     if (ret_value != SUCCEED)
         ret_value = -1;
@@ -1767,7 +1762,7 @@ done:
 
 
 /*-------------------------------------------------------------------------
- * Function:    H5VL_deltafs_group_read_all
+ * Function:    H5VL_deltafs_group_read
  *
  * Purpose:     Reads in all the values of all dataset of group into buffer
  *
@@ -1780,37 +1775,41 @@ done:
  *-------------------------------------------------------------------------
  */
 static herr_t
-H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
+H5VL_deltafs_group_read(H5VL_deltafs_group_t *grp)
 {
     H5VL_deltafs_file_t *file = grp->obj.item.file;
     deltafs_plfsdir_t *handle = NULL;
-    size_t i;
-    size_t buf_size;
+    size_t i, offset;
+    hsize_t dsets_size[HDF5_VOL_DELTAFS_MAX_DATASET];
+    hsize_t dsets_off[HDF5_VOL_DELTAFS_MAX_DATASET];
     H5VL_deltafs_cb_arg_t arg;
     double start, total;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
 
-    HDassert(grp->is_read == false);
-    HDassert(grp->buf == NULL);
-    HDassert(grp->buf_size == 0);
     HDassert(!(file->flags & H5F_ACC_WRONLY));
 
     arg.grp = grp;
-    if (H5VL_deltafs_get_elem_size(file, &arg.elem_size, NULL) < 0)
+    arg.dsets_size = dsets_size;
+    arg.dsets_off = dsets_off;
+    arg.count = 0;
+
+    if (H5VL_deltafs_get_elem_size(file, &arg.elem_size, dsets_size) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't get elem size")
 
     if (grp->is_num_elem_found == 0 && H5VL_deltafs_group_find_num_elems(grp) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't find number of elements in group")
 
-    buf_size = grp->num_elems * arg.elem_size;
-    
-    /* During read, we know the exact amount of memory needed */
-    if(NULL == (grp->buf = (char *)H5MM_malloc(buf_size)))
-        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't allocate space for buffer")
-    grp->buf_size = buf_size;
-
+    for (i = 0, offset = 0; i < grp->num_datasets; i++) {
+        H5VL_deltafs_dset_t *dset = grp->dsets[i];
+        if (!dset)
+            continue;
+        dset->mem_cur_offset = dset->mem_dims.stride * dset->mem_dims.start * 
+            dsets_size[i];
+        dsets_off[i] = offset;
+        offset += dsets_size[i];
+    }
 
     /* Scan all rank files for dataset's data */
     for (i = 0; i < file->fmd.total_ranks; i++) {
@@ -1843,22 +1842,61 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
         handle = NULL;
     }
 
-    grp->is_read = true;
-    if (grp->buf_size > file->max_grp_buf_size)
-        file->max_grp_buf_size = grp->buf_size;
-
 done:
     if (handle != NULL) {
         if (deltafs_plfsdir_free_handle(handle) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
     }
 
+    FUNC_LEAVE_NOAPI(ret_value)
+}
 
-    if (grp->is_read == false) {
-        H5MM_xfree(grp->buf);
-        grp->buf_size = 0;
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_write_elem
+ *
+ * Purpose:     Writes's a single element's data in current deltafs file
+ *
+ * Return:      Success:        SUCCESS
+ *              Failure:        FAIL
+ *
+ * Programmer:  Saksham Jain
+ *              July, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static herr_t
+H5VL_deltafs_write_elem(H5VL_deltafs_file_t *file, char *buf, size_t buf_size, 
+        size_t key_size)
+{
+    char fname[PATH_MAX];
+    uint64_t tag;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    /* Key is the first in the buf */
+    switch (key_size) {
+    case 1:
+        tag = *((uint8_t *)buf);
+        break;
+    case 2:
+        tag = *((uint16_t *)buf);
+        break;
+    case 4:
+        tag = *((uint32_t *)buf);
+        break;
+    case 8:
+        tag = *((uint64_t *)buf);
+        break;
+    default:
+        assert(0 && "Unknown size of tag");
     }
     
+    snprintf(fname, sizeof(fname), "%s/%" PRIu64, file->name, tag);
+    if (deltafs_preload_write(fname, buf, buf_size) < 0)
+        HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't write to deltafs file")
+done:
     FUNC_LEAVE_NOAPI(ret_value)
 }
 
@@ -1882,11 +1920,10 @@ H5VL_deltafs_group_write(H5VL_deltafs_group_t *grp)
     H5VL_deltafs_file_t *file = grp->obj.item.file;
     hsize_t elem_size;
     size_t i, j;
-    size_t voffset, boffset, keyoff, keysize;
+    size_t voffset, keysize;
     hsize_t dsets_size[HDF5_VOL_DELTAFS_MAX_DATASET];
-    char fname[PATH_MAX];
     char *value = NULL;
-    uint64_t tag;
+    hbool_t is_contiguous = true;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -1894,7 +1931,6 @@ H5VL_deltafs_group_write(H5VL_deltafs_group_t *grp)
     HDassert(grp->dirty == true);
     HDassert(file->flags & H5F_ACC_WRONLY);
     HDassert(grp->num_datasets != 0);
-    HDassert(grp->buf != NULL);
     HDassert(grp->num_elems != 0);
 
     if (file->fmd.num_datasets != grp->num_datasets)
@@ -1903,9 +1939,6 @@ H5VL_deltafs_group_write(H5VL_deltafs_group_t *grp)
     if (H5VL_deltafs_get_elem_size(file, &elem_size, dsets_size) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't get elem size")
 
-    HDassert(grp->buf_filled_len == elem_size * grp->num_elems);
-
-    /* TODO: This leads to 3-4 times memcpy throughout the application till deltafs */
     if(NULL == (value = (char *)H5MM_malloc(elem_size)))
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't allocate space for buffer")
 
@@ -1915,40 +1948,74 @@ H5VL_deltafs_group_write(H5VL_deltafs_group_t *grp)
     if (MPI_Barrier(MPI_COMM_WORLD) != MPI_SUCCESS)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "MPI Barrier failed")
 
-    for (i = 0; i < grp->num_elems; i++) {
-        for (j = 0, voffset = 0, boffset = 0; j < grp->num_datasets; j++) {
-            size_t len = dsets_size[j];
-            size_t boff = boffset + i * len; 
-            memcpy(&value[voffset], &grp->buf[boff], len);
-            voffset += len;
-            boffset += grp->num_elems * len;
-        }
-
-        /* Tag is the first dataset */
-        keysize = dsets_size[0];
-        keyoff = keysize * i;
-
-        switch (keysize) {
-        case 1:
-            tag = *((uint8_t *)&grp->buf[keyoff]);
-            break;
-        case 2:
-            tag = *((uint16_t *)&grp->buf[keyoff]);
-            break;
-        case 4:
-            tag = *((uint32_t *)&grp->buf[keyoff]);
-            break;
-        case 8:
-            tag = *((uint64_t *)&grp->buf[keyoff]);
-            break;
-        default:
-            assert(0 && "Unknown size of tag");
-        }
-        
-        snprintf(fname, sizeof(fname), "%s/%" PRIu64, file->name, tag);
-        if (deltafs_preload_write(fname, value, elem_size) < 0)
-            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't write to deltafs file")
+    for (i = 0; i < grp->num_datasets; i++) {
+        H5VL_deltafs_dset_t *dset = grp->dsets[i];
+        dset->mem_cur_offset = dset->mem_dims.stride * dset->mem_dims.start * 
+            dsets_size[i];
     }
+
+    /* Check if all the datasets are contiguous together (i.e. strided) */
+    /* 
+     * TODO: Improve this. Can be contiguous without needing to be equal to elem_size.
+     * Could be more
+     */
+    for (i = 0; i < grp->num_datasets; i++) {
+        H5VL_deltafs_dset_t *dset = grp->dsets[i];
+
+        /* Strides for all should be equal to total elem size */
+        if (dset->mem_dims.stride * dsets_size[i] != elem_size) {
+            is_contiguous = false;
+            break;
+        }
+        /* Buffer should start at proper offsets */
+        if (i != grp->num_datasets - 1) {
+
+            H5VL_deltafs_dset_t *next_dset = grp->dsets[i + 1];
+
+            uintptr_t dset_start = (uintptr_t)(dset->buf) + dset->mem_cur_offset;
+            uintptr_t dset_next_start = (uintptr_t)(next_dset->buf) +
+                next_dset->mem_cur_offset;
+
+            if (dset_start + dsets_size[i] != dset_next_start) {
+                is_contiguous = false;
+                break;
+            }
+        }
+    }
+
+    /* Tag is the first dataset */
+    keysize = dsets_size[0];
+
+    /* We can optimize incase the datasets are contiguous */
+    if (is_contiguous) {
+
+       char *buf = (char *)grp->dsets[0]->buf;
+
+        for (i = 0; i < grp->num_elems; i++) {
+            if (H5VL_deltafs_write_elem(file, &buf[i * elem_size],
+                                        elem_size, keysize) < 0)
+            HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't write to deltafs file")
+        }
+
+    } else {
+
+        for (i = 0; i < grp->num_elems; i++) {
+            for (j = 0, voffset = 0; j < grp->num_datasets; j++) {
+                
+                H5VL_deltafs_dset_t *dset = grp->dsets[j];
+                size_t len = dsets_size[j];
+                char *buf = (char *)dset->buf;
+                size_t boff = dset->mem_cur_offset;
+
+                memcpy(&value[voffset], &buf[boff], len);
+                voffset += len;
+                dset->mem_cur_offset += dset->mem_dims.stride * dsets_size[j];
+            }
+
+            if (H5VL_deltafs_write_elem(file, value, elem_size, keysize) < 0)
+                HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't write to deltafs file")
+        }
+     }
 
     deltafs_preload_flush_epoch();
 
@@ -1991,9 +2058,16 @@ H5VL_deltafs_group_close_helper(H5VL_deltafs_group_t *grp)
 
             if(H5VL_deltafs_group_write(grp) < 0)
                 HDONE_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't write to deltafs file")
+
+        } else if (grp->is_read) {
+            if (H5VL_deltafs_group_read(grp) < 0)
+                HDONE_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't read from deltafs file")
         }
 
-        H5MM_xfree(grp->buf);
+        for (size_t i = 0; i < grp->num_datasets; i++)
+            if (grp->dsets[i])
+                H5FL_FREE(H5VL_deltafs_dset_t, grp->dsets[i]);
+
         grp = H5FL_FREE(H5VL_deltafs_group_t, grp);
     }
 
@@ -2340,8 +2414,11 @@ H5VL_deltafs_dataset_create(void *_item,
     dset->obj.item.file = item->file;
     dset->obj.item.rc = 1;
     dset->index = didx;
+    dset->buf = NULL;
     dset->dmd = &file->fmd.dmd[didx];
     dset->parent_grp = grp;
+    grp->dsets[didx] = dset;
+    dset->close_with_group = true;
     grp->obj.item.rc++;
 
     /* Set return value */
@@ -2409,6 +2486,7 @@ H5VL_deltafs_dataset_open(void *_item,
     dset->obj.item.file = item->file;
     dset->obj.item.rc = 1;
     dset->index = didx;
+    dset->buf = NULL;
     dset->dmd = dmd;
     dset->parent_grp = grp;
     grp->obj.item.rc++;
@@ -2427,121 +2505,6 @@ done:
     FUNC_LEAVE_NOAPI(ret_value)
 
 } /* end H5VL_deltafs_dataset_open() */
-
-/*-------------------------------------------------------------------------
- * Function:    H5VL_deltafs_xfer
- *
- * Purpose:     Given a source and setination dataspace with a selection and 
- *              the datatype (element) size, transfer bytes from src to destination
- *              Does not releae buffers on error.
- *
- * Return:      Success:        0
- *              Failure:        -1
- *
- * Programmer:  Saksham Jain
- *              March, 2018
- *
- *-------------------------------------------------------------------------
- */
-static herr_t
-H5VL_deltafs_xfer(void *_dest_buf, H5S_t *dest_space, size_t dest_type_size,
-        const void *_src_buf, H5S_t *src_space, size_t src_type_size, size_t total_size)
-{
-    uint8_t *dest_buf = (uint8_t *)_dest_buf;
-    const uint8_t *src_buf = (const uint8_t *)_src_buf;
-    H5S_sel_iter_t src_sel_iter;                /* Selection iteration info */
-    hbool_t src_sel_iter_init = FALSE;      /* Selection iteration info has been initialized */
-    H5S_sel_iter_t dest_sel_iter;
-    hbool_t dest_sel_iter_init = FALSE;
-    size_t src_nseq = 0, dest_nseq = 0;
-    size_t src_i = 0, dest_i = 0;
-    size_t src_nelem, dest_nelem;
-    hsize_t src_off[H5VL_DELTAFS_SEQ_LIST_LEN];
-    size_t src_len[H5VL_DELTAFS_SEQ_LIST_LEN];
-    hsize_t dest_off[H5VL_DELTAFS_SEQ_LIST_LEN];
-    size_t dest_len[H5VL_DELTAFS_SEQ_LIST_LEN];
-    size_t total_xfer = 0;
-    herr_t ret_value = SUCCEED;
-
-    FUNC_ENTER_NOAPI_NOINIT
-
-    HDassert(src_buf && dest_buf);
-    HDassert(src_space && dest_space);
-
-    if(H5S_select_iter_init(&src_sel_iter, src_space, src_type_size) < 0)
-        HGOTO_ERROR(H5E_DATASPACE, H5E_CANTINIT, FAIL, "unable to initialize selection iterator")
-    src_sel_iter_init = TRUE;
-
-     if(H5S_select_iter_init(&dest_sel_iter, dest_space, dest_type_size) < 0)
-        HGOTO_ERROR(H5E_DATASPACE, H5E_CANTINIT, FAIL, "unable to initialize selection iterator")
-    dest_sel_iter_init = TRUE;
-
-    /* Generate sequences from the file space until finished */
-    do {
-        /* Get the sequences of bytes */
-        if(src_i == src_nseq) {
-            src_i = 0;
-            
-            /* TODO: Find the correct way to handle this */
-            if (src_sel_iter.elmt_left == 0)
-                break;
-
-            if (H5S_SELECT_GET_SEQ_LIST(src_space, 0, &src_sel_iter,
-                    (size_t)H5VL_DELTAFS_SEQ_LIST_LEN, (size_t)-1, &src_nseq, &src_nelem, src_off, src_len) < 0)
-                HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
-        }
-        if(dest_i == dest_nseq) {
-            dest_i = 0;
-
-            if (dest_sel_iter.elmt_left == 0)
-                break;
-
-            if (H5S_SELECT_GET_SEQ_LIST(dest_space, 0, &dest_sel_iter,
-                    (size_t)H5VL_DELTAFS_SEQ_LIST_LEN, (size_t)-1, &dest_nseq, &dest_nelem, dest_off, dest_len) < 0)
-                HGOTO_ERROR(H5E_DATASPACE, H5E_CANTGET, FAIL, "sequence length generation failed")
-        }
-
-        /* Copy wrt to offsets/lengths */
-        while (src_i < src_nseq && dest_i < dest_nseq) {
-            size_t xfer_len;
-            hsize_t src_offset = src_off[src_i];
-            hsize_t dest_offset = dest_off[dest_i];
-
-            if (src_len[src_i] < dest_len[dest_i]) {
-                xfer_len = src_len[src_i];
-                src_i++;
-                dest_len[dest_i] -= xfer_len;
-                dest_off[dest_i] += xfer_len;
-            } else if (src_len[src_i] > dest_len[dest_i]) {
-                xfer_len = dest_len[src_i];
-                dest_i++;
-                src_len[src_i] -= xfer_len;
-                src_off[src_i] += xfer_len;
-            } else {
-                xfer_len = src_len[src_i];
-                src_i++;
-                dest_i++;
-            }
-
-            HDmemcpy((void *)&dest_buf[dest_offset], (const void *)&src_buf[src_offset], xfer_len);
-            total_xfer += xfer_len;
-        }
-
-    } while(src_nseq == H5VL_DELTAFS_SEQ_LIST_LEN || dest_nseq == H5VL_DELTAFS_SEQ_LIST_LEN);
-
-    /* XXX: Is this always true? */
-    HDassert(total_xfer == total_size);
-
-done:
-    /* Release selection iterators */
-    if(src_sel_iter_init && H5S_SELECT_ITER_RELEASE(&src_sel_iter) < 0)
-        HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL, "unable to release selection iterator")
-    if(dest_sel_iter_init && H5S_SELECT_ITER_RELEASE(&dest_sel_iter) < 0)
-        HDONE_ERROR(H5E_DATASPACE, H5E_CANTRELEASE, FAIL, "unable to release selection iterator")
-
-    FUNC_LEAVE_NOAPI(ret_value)
-
-} /* end H5VL_deltafs_xfer() */
 
 
 /*-------------------------------------------------------------------------
@@ -2566,15 +2529,10 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     H5VL_deltafs_group_t *grp = dset->parent_grp;
     H5VL_deltafs_file_t *file = dset->obj.item.file;
     H5VL_deltafs_dmd_t *dmd = dset->dmd;
-    hid_t real_file_space_id = -1;
     hid_t real_mem_space_id = -1;
-    H5S_t *file_space = NULL;
     H5S_t *mem_space = NULL;
-    hsize_t type_size;
-    size_t i;
-    hsize_t len, offset, elem_size, num_elems, count;
-    hsize_t dsets_size[HDF5_VOL_DELTAFS_MAX_DATASET];
-    double start_time, total_time;
+    hsize_t num_elems, type_size;
+    int ndims;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -2591,15 +2549,13 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     if (H5Tequal(mem_type_id, dmd->type_id) != true)
         HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "improper mem type")
 
-    if ((type_size = H5Tget_size(mem_type_id)) == 0)
+    if((type_size = H5Tget_size(mem_type_id)) == 0)
         HGOTO_ERROR(H5E_DATATYPE, H5E_CANTGET, FAIL, "can't get source type size")
 
-    if (H5VL_deltafs_get_elem_size(file, &elem_size, dsets_size) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't get elem size")
-
+            
     HDassert(grp->num_elems != 0);
+    
     num_elems = grp->num_elems;
-    len = grp->num_elems * elem_size;
 
     if(mem_space_id == H5S_ALL) {
         if((real_mem_space_id = H5Screate_simple(1, &num_elems, NULL)) < 0)
@@ -2608,21 +2564,20 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
         real_mem_space_id = mem_space_id;
     }
 
-    for (i = 0, offset = 0; i < dset->index; i++)
-        offset += dsets_size[i];
-
-    if((real_file_space_id = H5Screate_simple (1, &len, NULL)) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't create dataspace")
-
     if (file_space_id == H5S_ALL) {
-        count = num_elems;
-        if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &offset,
-	    		                    &elem_size, &count, &dsets_size[dset->index]) < 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't select dataspace")
+        dset->file_start = 0;
+        dset->file_end = num_elems - 1;
     } else {
-        int ndims;
+        
         hsize_t start, end;
+        H5S_t *file_space;
 
+        if(NULL == (file_space = (H5S_t *)H5I_object(file_space_id)))
+            HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID")
+
+        if (!H5S_SELECT_IS_CONTIGUOUS(file_space))
+            HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "Only reading of contiguous data allowed");
+        
         if((ndims = H5Sget_simple_extent_ndims(file_space_id)) < 0)
             HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "can't get number of dimensions")
 
@@ -2632,37 +2587,38 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
         if (H5Sget_select_bounds(file_space_id, &start, &end ) < 0)
             HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "can't get bounding box")
 
-        count = end - start + 1;
-        
-        offset += elem_size * start;
-
-        if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &offset,
-	    		                    &elem_size, &count, &dsets_size[dset->index]) < 0)
-            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't select dataspace")
+        dset->file_start = start;
+        dset->file_end = end;
     }
 
     /* Get file dataspace object */
-    if(NULL == (file_space = (H5S_t *)H5I_object(real_file_space_id)))
-            HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID")
-
     if(NULL == (mem_space = (H5S_t *)H5I_object(real_mem_space_id)))
-            HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID")
+        HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID")
 
-    if (grp->is_read == false && H5VL_deltafs_group_read_all(grp) < 0)
-        HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't read group data")
+    if (!H5S_SELECT_IS_REGULAR(mem_space))
+        HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "memspace is not regular. Not supported currently.");
 
-    start_time = MPI_Wtime();
-    /* Transfer from dset buf to buffer */
-    if(H5VL_deltafs_xfer((void *)buf, mem_space, type_size,
-                (void *)grp->buf, file_space, 1, count * type_size) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't read from memory")
+    if((ndims = H5Sget_simple_extent_ndims(real_mem_space_id)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get number of dimensions")
 
-    total_time = MPI_Wtime() - start_time;
-    printf("HDF5_ReadXfer:Rank:%d, Time:%f\n", file->rank, total_time);
+    if (ndims != 1)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unsupported number of dimensions")
+
+    dset->mem_dims = mem_space->select.sel_info.hslab->app_diminfo[0];
+
+    if (dset->mem_dims.block != 1)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unsupported block size")
+
+    dset->buf = buf;
+    grp->is_read = true;
+
+    if (grp->dsets[dset->index])
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "already read this dataset")
+
+    grp->dsets[dset->index] = dset;
+    dset->close_with_group = true;
+
 done:
-    if (real_file_space_id > 0 && H5Sclose(real_file_space_id ) < 0)
-        HDONE_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't close dataspace")
-
     if (mem_space_id == H5S_ALL && real_mem_space_id > 0 && H5Sclose(real_mem_space_id) < 0)
         HDONE_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't close dataspace")
 
@@ -2691,15 +2647,11 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     H5VL_deltafs_group_t *grp = dset->parent_grp;
     H5VL_deltafs_file_t *file = dset->obj.item.file;
     H5VL_deltafs_dmd_t *dmd = dset->dmd;
-    hid_t real_file_space_id = -1;
-    hid_t real_mem_space_id;
-    H5S_t *file_space = NULL;
+    hid_t real_mem_space_id = -1;
     H5S_t *mem_space = NULL;
-    size_t type_size;
-    hsize_t nelems;
+    hsize_t nelems, type_size;
     hssize_t tnelems;
-    size_t len, buf_size;
-    char *gbuf;
+    int ndims;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -2725,7 +2677,6 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
         HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get number of elements in selection")
     
     nelems = (hsize_t)tnelems;
-    len = nelems * type_size;
 
     if (grp->num_elems == 0) {
         grp->num_elems = nelems;
@@ -2733,47 +2684,37 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
          HGOTO_ERROR(H5E_FILE, H5E_BADVALUE, FAIL, "incorrect number of elements")
     }
 
-    /* Expand group if it is not sufficiently large */
-    if (grp->buf_size - grp->buf_filled_len < len) {
-        buf_size = grp->buf_filled_len + len;
-        buf_size = buf_size > file->max_grp_buf_size ? buf_size : file->max_grp_buf_size;
-
-        if(NULL == (gbuf = (char *)H5MM_realloc(grp->buf, buf_size)))
-            HGOTO_ERROR(H5E_RESOURCE, H5E_CANTALLOC, FAIL, "can't allocate buffer for serialized datatype")
-
-        grp->buf = gbuf;
-        grp->buf_size = buf_size;
-
-        if (buf_size > file->max_grp_buf_size)
-            file->max_grp_buf_size = buf_size;
+    if(mem_space_id == H5S_ALL) {
+        if((real_mem_space_id = H5Screate_simple (1, &nelems, NULL)) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't create dataspace");
+    } else {
+        real_mem_space_id = mem_space_id;
     }
 
-    if((real_file_space_id = H5Screate_simple (1, &nelems, NULL)) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't create dataspace");
-
-    if(mem_space_id == H5S_ALL)
-        real_mem_space_id = real_file_space_id;
-    else
-        real_mem_space_id = mem_space_id;
-
      /* Get file dataspace object */
-    if(NULL == (file_space = (H5S_t *)H5I_object(real_file_space_id)))
-            HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID");
-
     if(NULL == (mem_space = (H5S_t *)H5I_object(real_mem_space_id)))
-            HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID");
+        HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID");
 
-    /* Transfer from buf to dset buffer */
-    if(H5VL_deltafs_xfer((void *)&grp->buf[grp->buf_filled_len],
-                file_space, type_size, (const void *)buf, mem_space, type_size, len) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't read from memory")
+    if (!H5S_SELECT_IS_REGULAR(mem_space))
+        HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "memspace is not regular. Not supported currently.");
 
-    grp->buf_filled_len += len;
+    if((ndims = H5Sget_simple_extent_ndims(real_mem_space_id)) < 0)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't get number of dimensions")
+
+    if (ndims != 1)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unsupported number of dimensions")
+
+    dset->mem_dims = mem_space->select.sel_info.hslab->app_diminfo[0];
+
+    if (dset->mem_dims.block != 1)
+        HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "unsupported block size")
+
+    dset->buf = (void *)buf;
     grp->dirty = true;
 
 done:
-
-    if (real_file_space_id > 0 && H5Sclose(real_file_space_id ) < 0)
+    if ((mem_space_id == H5S_ALL) && (real_mem_space_id > 0) &&
+            (H5Sclose(real_mem_space_id) < 0))
         HDONE_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't close dataspace")
 
     FUNC_LEAVE_NOAPI(ret_value)
@@ -2879,7 +2820,9 @@ H5VL_deltafs_dataset_close_helper(H5VL_deltafs_dset_t *dset)
         if(dset->parent_grp && H5VL_deltafs_group_close_helper(dset->parent_grp) < 0)
             HDONE_ERROR(H5E_FILE, H5E_CLOSEERROR, FAIL, "can't close group")
 
-        dset = H5FL_FREE(H5VL_deltafs_dset_t, dset);
+        /* Dset is freed when the group is closed */
+        if (!dset->close_with_group)
+            H5FL_FREE(H5VL_deltafs_dset_t, dset);
     }
 
     FUNC_LEAVE_NOAPI(ret_value)
@@ -2985,7 +2928,6 @@ H5VL_deltafs_link_specific(void *_item, H5VL_loc_params_t loc_params,
                 char *p;
 		        ssize_t i;
                 size_t num_links;
-		        H5VL_deltafs_group_t *grp = NULL;
 		        hbool_t isFile;
                 hbool_t inc;
 
@@ -2998,8 +2940,7 @@ H5VL_deltafs_link_specific(void *_item, H5VL_loc_params_t loc_params,
 	    			    num_links = file->fmd.num_groups;
 		    		    isFile = true; 
                     } else if(item->type == H5I_GROUP) {
-	    			    grp = (H5VL_deltafs_group_t *)item;
-		    		    num_links = grp->num_datasets;
+		    		    num_links = file->fmd.num_datasets;
 			    	    isFile = false;
     	            } else {
                         HGOTO_ERROR(H5E_ARGS, H5E_BADTYPE, FAIL, "item not a file or group")

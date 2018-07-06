@@ -11,6 +11,8 @@
 #include "H5VLdeltafs_public.h"
 #include "H5VLprivate.h"
 
+#include "H5Sprivate.h"
+
 #include "deltafs_api.h"
 
 #define HDF5_VOL_DELTAFS_VERSION_1	    1	    /* Version number of VOL plugin */
@@ -58,9 +60,19 @@ typedef struct H5VL_deltafs_fmd_t {
 /* The dataset struct */
 typedef struct H5VL_deltafs_dset_t {
     H5VL_deltafs_obj_t obj;                 /* Must be first */
-    char name[HDF5_VOL_DELTAFS_MAX_NAME + 1];
     struct H5VL_deltafs_group_t *parent_grp;
     size_t index;
+
+    /* Metadata to read/write */
+    H5S_t *mem_space;
+    void *buf;
+    H5S_hyper_dim_t mem_dims;
+    hsize_t mem_cur_offset;
+    hsize_t file_start;
+    hsize_t file_end;
+   
+    hbool_t close_with_group;
+
     H5VL_deltafs_dmd_t *dmd;
 
 } H5VL_deltafs_dset_t;
@@ -72,12 +84,11 @@ typedef struct H5VL_deltafs_group_t {
     size_t num_datasets;
     size_t num_elems;
 
-    char *buf;
-    size_t buf_filled_len;                  /* How much has buffer been written */
-    size_t buf_size;
     hbool_t is_num_elem_found;              /* Has number of element been found */
     hbool_t is_read;                        /* Has group buffer been read ? */
     hbool_t dirty;
+
+    H5VL_deltafs_dset_t *dsets[HDF5_VOL_DELTAFS_MAX_DATASET];
 
 } H5VL_deltafs_group_t;
 
@@ -94,7 +105,7 @@ typedef struct H5VL_deltafs_file_t {
 
     hbool_t is_open;                        /* File can be opened once only at a time */
     hbool_t dirty;
-
+ 
     /* Link list */
     struct H5VL_deltafs_file_t *lnext;
     struct H5VL_deltafs_file_t *lprev;
@@ -112,6 +123,9 @@ typedef struct H5VL_deltafs_cb_arg {
     hbool_t fail;                           /* Has the callback failed? */
     hsize_t elem_size;
     H5VL_deltafs_group_t *grp;
+    hsize_t *dsets_size;
+    hsize_t *dsets_off;
+    hsize_t count;
 
 } H5VL_deltafs_cb_arg_t;
 
