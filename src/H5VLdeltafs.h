@@ -70,7 +70,7 @@ typedef struct H5VL_deltafs_group_t {
     H5VL_deltafs_obj_t obj;                 /* Must be first */
     size_t index;
     size_t num_datasets;
-    size_t num_elems;
+    hsize_t num_elems;
 
     char *buf;
     size_t buf_filled_len;                  /* How much has buffer been written */
@@ -112,6 +112,8 @@ typedef struct H5VL_deltafs_cb_arg {
     hbool_t fail;                           /* Has the callback failed? */
     hsize_t elem_size;
     H5VL_deltafs_group_t *grp;
+    hsize_t *dsets_size;
+    char **dsets_buf;
 
 } H5VL_deltafs_cb_arg_t;
 

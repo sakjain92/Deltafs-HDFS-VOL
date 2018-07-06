@@ -1662,6 +1662,7 @@ H5VL_deltafs_group_find_num_elems(H5VL_deltafs_group_t *grp)
     deltafs_plfsdir_t *handle = NULL;
     size_t i;
     ssize_t num_keys;
+    double start;
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -1672,6 +1673,8 @@ H5VL_deltafs_group_find_num_elems(H5VL_deltafs_group_t *grp)
     HDassert(grp->buf_size == 0);
     HDassert(grp->num_elems == 0);
     HDassert(!(file->flags & H5F_ACC_WRONLY));
+
+    start = MPI_Wtime();
 
     /* Scan all rank files for dataset's data */
     for (i = 0; i < file->fmd.total_ranks; i++) {
@@ -1688,13 +1691,14 @@ H5VL_deltafs_group_find_num_elems(H5VL_deltafs_group_t *grp)
         if ((num_keys = deltafs_plfsdir_count(handle, (int)grp->index)) < 0)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't count keys in groups")
 
-        grp->num_elems += (long unsigned int)num_keys;
+        grp->num_elems += (hsize_t)num_keys;
 
         if (deltafs_plfsdir_free_handle(handle) < 0)
             HDONE_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
 
         handle = NULL;
     }
+    printf("HDF5:NumElems:Time:%f\n", MPI_Wtime() - start);
 
     grp->is_num_elem_found = true;
 
@@ -1720,17 +1724,19 @@ done:
  *
  *-------------------------------------------------------------------------
  */
+__attribute__((optimize("unroll-loops")))
 static int
 H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
                         size_t H5_ATTR_UNUSED keylen, const char *value,
-                        size_t sz)
+                        size_t H5_ATTR_UNUSED sz)
 {
     H5VL_deltafs_cb_arg_t *arg = (H5VL_deltafs_cb_arg_t *)_arg;
     H5VL_deltafs_group_t *grp = arg->grp;
-    size_t buf_index;
     int ret_value = 0;
 
-    FUNC_ENTER_NOAPI_NOINIT
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+#if 0   /* These checks might slow down */
 
     HDassert(grp->buf_filled_len <= grp->buf_size);
 
@@ -1755,11 +1761,16 @@ H5VL_deltafs_group_scanner(void* _arg, const char H5_ATTR_UNUSED *key,
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, -1, "buffer overflow")
     }
 
-    buf_index = grp->buf_filled_len;
-    memcpy(&grp->buf[buf_index], value, sz);
-    grp->buf_filled_len += sz;
+#endif
+
+    /* Maximum size of any type is 8 bytes */
+    for (size_t i = 0, off = 0; i < grp->num_datasets; i++) {
+        hsize_t size = arg->dsets_size[i];
+        memcpy(arg->dsets_buf[i], &value[off], size);
+        arg->dsets_buf[i] += size;
+        off += size;
+    }
     
-done:
     if (ret_value != SUCCEED)
         ret_value = -1;
     FUNC_LEAVE_NOAPI(ret_value)
@@ -1785,9 +1796,12 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
     H5VL_deltafs_file_t *file = grp->obj.item.file;
     deltafs_plfsdir_t *handle = NULL;
     size_t i;
-    size_t buf_size;
+    hsize_t buf_size;
     H5VL_deltafs_cb_arg_t arg;
     double start, total;
+    hsize_t dsets_size[HDF5_VOL_DELTAFS_MAX_DATASET];
+    hsize_t off;
+    char *dsets_buf[HDF5_VOL_DELTAFS_MAX_DATASET];
     herr_t ret_value = SUCCEED;
 
     FUNC_ENTER_NOAPI_NOINIT
@@ -1798,7 +1812,7 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
     HDassert(!(file->flags & H5F_ACC_WRONLY));
 
     arg.grp = grp;
-    if (H5VL_deltafs_get_elem_size(file, &arg.elem_size, NULL) < 0)
+    if (H5VL_deltafs_get_elem_size(file, &arg.elem_size, dsets_size) < 0)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't get elem size")
 
     if (grp->is_num_elem_found == 0 && H5VL_deltafs_group_find_num_elems(grp) < 0)
@@ -1811,6 +1825,13 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't allocate space for buffer")
     grp->buf_size = buf_size;
 
+    for (i = 0, off = 0; i < grp->num_datasets; i++) {
+        dsets_buf[i] = &grp->buf[off];
+        off += dsets_size[i] * grp->num_elems;
+    }
+
+    arg.dsets_size = dsets_size;
+    arg.dsets_buf = dsets_buf;
 
     /* Scan all rank files for dataset's data */
     for (i = 0; i < file->fmd.total_ranks; i++) {
@@ -1844,6 +1865,8 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
     }
 
     grp->is_read = true;
+    grp->buf_filled_len = grp->num_elems * arg.elem_size;
+
     if (grp->buf_size > file->max_grp_buf_size)
         file->max_grp_buf_size = grp->buf_size;
 
@@ -2429,6 +2452,144 @@ done:
 } /* end H5VL_deltafs_dataset_open() */
 
 /*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_is_xfer_opt
+ *
+ * Purpose:     Given a space id, checks if it is a suitable candidate for
+ *              optimized memory transfer.
+ *
+ * Return:      Success:        TRUE
+ *              Failure:        FALSE
+ *
+ * Programmer:  Saksham Jain
+ *              July, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+static hbool_t
+H5VL_deltafs_is_xfer_opt(hid_t space_id)
+{
+    H5S_sel_type sel;
+    hbool_t ret_value = TRUE;        /* Return value */
+
+    FUNC_ENTER_NOAPI_NOINIT_NOERR
+
+    sel = H5Sget_select_type(space_id);
+    if (sel != H5S_SEL_HYPERSLABS && sel != H5S_SEL_ALL) {
+        
+        ret_value = FALSE;
+
+    } else if (sel == H5S_SEL_HYPERSLABS &&
+            !H5Sis_regular_hyperslab(space_id)) {
+        
+        ret_value = FALSE;
+    }
+
+    FUNC_LEAVE_NOAPI(ret_value)
+}   /* end H5Sget_select_type() */
+
+/*-------------------------------------------------------------------------
+ * Function:    H5VL_deltafs_xfer_opt
+ *
+ * Purpose:     Given a source and setination dataspace with a selection and 
+ *              the datatype (element) size, transfer bytes from src to destination
+ *              Does not releae buffers on error. This function is optimized
+ *              version when both source and destination spaces are regular
+ *              and one dimensional.
+ *
+ * Return:      Success:        0
+ *              Failure:        -1
+ *
+ * Programmer:  Saksham Jain
+ *              March, 2018
+ *
+ *-------------------------------------------------------------------------
+ */
+__attribute__((optimize("unroll-loops")))
+static herr_t
+H5VL_deltafs_xfer_opt(void *_dest_buf, hid_t dest_space_id, size_t dest_type_size,
+        const void *_src_buf, hid_t src_space_id, size_t src_type_size, size_t total_size)
+{
+    uint8_t *dest_buf = (uint8_t *)_dest_buf;
+    const uint8_t *src_buf = (const uint8_t *)_src_buf;
+    hsize_t dest_start, dest_stride, dest_count, dest_block;
+    hsize_t src_start, src_stride, src_count, src_block;
+    hsize_t src_block_size, dest_block_size;
+    hsize_t src_stride_size, dest_stride_size;
+    hsize_t src_start_size, dest_start_size, len;
+    hsize_t dest_off, src_off;
+    herr_t ret_value = SUCCEED;
+
+    FUNC_ENTER_NOAPI_NOINIT
+
+    if (H5Sget_select_type(dest_space_id) == H5S_SEL_ALL) {
+
+        hsize_t start, end;
+        if (H5Sget_select_bounds(dest_space_id, &start, &end) < 0)
+            HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "can't get bounding box")
+        
+        dest_start = start;
+        dest_stride = 1;
+        dest_block = 1;
+        dest_count = end - start + 1;
+
+    } else if (H5Sget_regular_hyperslab(dest_space_id, &dest_start, &dest_stride,
+                &dest_count, &dest_block) < 0)
+        HGOTO_ERROR(H5E_DATASPACE, H5E_CANTINIT, FAIL, "unable to get dimesions")
+
+    if (H5Sget_select_type(src_space_id) == H5S_SEL_ALL) {
+
+        hsize_t start, end;
+        if (H5Sget_select_bounds(dest_space_id, &start, &end) < 0)
+            HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "can't get bounding box")
+
+        src_start = start;
+        src_stride = 1;
+        src_block = 1;
+        src_count = end - start + 1;
+
+    } else if (H5Sget_regular_hyperslab(src_space_id, &src_start, &src_stride,
+                &src_count, &src_block) < 0)
+        HGOTO_ERROR(H5E_DATASPACE, H5E_CANTINIT, FAIL, "unable to get dimesions")
+
+    src_block_size = src_block * src_type_size;
+    dest_block_size = dest_block * dest_type_size;
+    
+    src_stride_size = src_stride * src_type_size;
+    dest_stride_size = dest_stride * dest_type_size;
+
+    src_start_size = src_start * src_type_size;
+    dest_start_size = dest_start * dest_type_size;
+
+    HDassert(src_block_size == dest_block_size);
+    HDassert(src_count == dest_count);
+
+    len = src_count * src_block_size;
+
+    HDassert(total_size == len);
+
+    /* Are both src and dest contiguous? */
+    if (src_stride_size == src_block_size && dest_stride_size == dest_block_size) {
+        
+        memcpy(&dest_buf[dest_start_size], &src_buf[src_start_size], len);
+
+    } else {
+
+        dest_off = dest_start_size;
+        src_off = src_start_size;
+
+        for (hsize_t i = 0; i < dest_count; i++) {
+            memcpy(&dest_buf[dest_off], &src_buf[src_off], dest_block_size);
+            src_off += src_stride_size;
+            dest_off += dest_stride_size;
+        }
+
+    }
+
+done:
+    FUNC_LEAVE_NOAPI(ret_value)
+}
+
+/*-------------------------------------------------------------------------
  * Function:    H5VL_deltafs_xfer
  *
  * Purpose:     Given a source and setination dataspace with a selection and 
@@ -2470,10 +2631,12 @@ H5VL_deltafs_xfer(void *_dest_buf, H5S_t *dest_space, size_t dest_type_size,
 
     if(H5S_select_iter_init(&src_sel_iter, src_space, src_type_size) < 0)
         HGOTO_ERROR(H5E_DATASPACE, H5E_CANTINIT, FAIL, "unable to initialize selection iterator")
+
     src_sel_iter_init = TRUE;
 
      if(H5S_select_iter_init(&dest_sel_iter, dest_space, dest_type_size) < 0)
         HGOTO_ERROR(H5E_DATASPACE, H5E_CANTINIT, FAIL, "unable to initialize selection iterator")
+    
     dest_sel_iter_init = TRUE;
 
     /* Generate sequences from the file space until finished */
@@ -2572,7 +2735,7 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     H5S_t *mem_space = NULL;
     hsize_t type_size;
     size_t i;
-    hsize_t len, offset, elem_size, num_elems, count;
+    hsize_t offset, elem_size, num_elems, count;
     hsize_t dsets_size[HDF5_VOL_DELTAFS_MAX_DATASET];
     double start_time, total_time;
     herr_t ret_value = SUCCEED;
@@ -2599,28 +2762,38 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
 
     HDassert(grp->num_elems != 0);
     num_elems = grp->num_elems;
-    len = grp->num_elems * elem_size;
 
     if(mem_space_id == H5S_ALL) {
         if((real_mem_space_id = H5Screate_simple(1, &num_elems, NULL)) < 0)
             HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't create dataspace")
     } else {
+        int ndims;
+
         real_mem_space_id = mem_space_id;
+
+        if((ndims = H5Sget_simple_extent_ndims(mem_space_id)) < 0)
+            HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "can't get number of dimensions")
+
+        if (ndims != 1)
+            HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "incorrect number of dimensions")
     }
 
     for (i = 0, offset = 0; i < dset->index; i++)
-        offset += dsets_size[i];
+        offset += dsets_size[i] * grp->num_elems;
 
-    if((real_file_space_id = H5Screate_simple (1, &len, NULL)) < 0)
+    if((real_file_space_id = H5Screate_simple(1, &grp->num_elems, NULL)) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't create dataspace")
 
     if (file_space_id == H5S_ALL) {
+        hsize_t start = 0, stride = 1, block = 1;
         count = num_elems;
-        if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &offset,
-	    		                    &elem_size, &count, &dsets_size[dset->index]) < 0)
+
+        if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &start,
+	    		                    &stride, &count, &block) < 0)
             HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't select dataspace")
     } else {
         int ndims;
+        hsize_t stride = 1, block = 1;
         hsize_t start, end;
 
         if((ndims = H5Sget_simple_extent_ndims(file_space_id)) < 0)
@@ -2634,10 +2807,10 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
 
         count = end - start + 1;
         
-        offset += elem_size * start;
+        offset += type_size * start;
 
-        if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &offset,
-	    		                    &elem_size, &count, &dsets_size[dset->index]) < 0)
+        if (H5Sselect_hyperslab(real_file_space_id, H5S_SELECT_SET, &start,
+	    		                    &stride, &count, &block) < 0)
             HGOTO_ERROR(H5E_DATASET, H5E_CANTGET, FAIL, "can't select dataspace")
     }
 
@@ -2652,10 +2825,22 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
         HGOTO_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't read group data")
 
     start_time = MPI_Wtime();
+    
     /* Transfer from dset buf to buffer */
-    if(H5VL_deltafs_xfer((void *)buf, mem_space, type_size,
+    
+    /* Check if can be optimized */
+    if (H5VL_deltafs_is_xfer_opt(real_file_space_id) &&
+            H5VL_deltafs_is_xfer_opt(real_mem_space_id)) {
+        if (H5VL_deltafs_xfer_opt((void *)buf, real_mem_space_id, type_size,
+                (void *)&grp->buf[offset], real_file_space_id, type_size, count * type_size) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't read from memory")
+
+    } else {
+
+        if(H5VL_deltafs_xfer((void *)buf, mem_space, type_size,
                 (void *)grp->buf, file_space, 1, count * type_size) < 0)
-        HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't read from memory")
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't read from memory")
+    }
 
     total_time = MPI_Wtime() - start_time;
     printf("HDF5_ReadXfer:Rank:%d, Time:%f\n", file->rank, total_time);
@@ -2697,6 +2882,7 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     H5S_t *mem_space = NULL;
     size_t type_size;
     hsize_t nelems;
+    int ndims;
     hssize_t tnelems;
     size_t len, buf_size;
     char *gbuf;
@@ -2756,6 +2942,12 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     else
         real_mem_space_id = mem_space_id;
 
+    if((ndims = H5Sget_simple_extent_ndims(real_mem_space_id)) < 0)
+            HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "can't get number of dimensions")
+
+    if (ndims != 1)
+        HGOTO_ERROR(H5E_ATTR, H5E_CANTGET, FAIL, "incorrect number of dimensions")
+
      /* Get file dataspace object */
     if(NULL == (file_space = (H5S_t *)H5I_object(real_file_space_id)))
             HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID");
@@ -2764,9 +2956,19 @@ H5VL_deltafs_dataset_write(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
             HGOTO_ERROR(H5E_ATOM, H5E_BADATOM, FAIL, "can't find object for ID");
 
     /* Transfer from buf to dset buffer */
-    if(H5VL_deltafs_xfer((void *)&grp->buf[grp->buf_filled_len],
+    if (H5VL_deltafs_is_xfer_opt(real_file_space_id) &&
+            H5VL_deltafs_is_xfer_opt(real_mem_space_id)) {
+ 
+        if (H5VL_deltafs_xfer_opt((void *)&grp->buf[grp->buf_filled_len],
+                    real_file_space_id, type_size, 
+                    (const void *)buf, real_mem_space_id, type_size, len) < 0)
+            HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't read from memory")
+
+    } else {
+        if(H5VL_deltafs_xfer((void *)&grp->buf[grp->buf_filled_len],
                 file_space, type_size, (const void *)buf, mem_space, type_size, len) < 0)
         HGOTO_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't read from memory")
+    }
 
     grp->buf_filled_len += len;
     grp->dirty = true;
