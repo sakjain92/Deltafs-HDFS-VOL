@@ -1698,7 +1698,6 @@ H5VL_deltafs_group_find_num_elems(H5VL_deltafs_group_t *grp)
 
         handle = NULL;
     }
-    printf("HDF5:NumElems:Time:%f\n", MPI_Wtime() - start);
 
     grp->is_num_elem_found = true;
 
@@ -1856,7 +1855,6 @@ H5VL_deltafs_group_read_all(H5VL_deltafs_group_t *grp)
             HGOTO_ERROR(H5E_FILE, H5E_BADFILE, FAIL, "can't read file")
 
         total = MPI_Wtime() - start;
-        printf("HDF5_Scanner:Rank:%d, FileRank:%zu, Time:%f\n", file->rank, i, total);
 
         if (deltafs_plfsdir_free_handle(handle) < 0)
             HDONE_ERROR(H5E_FILE, H5E_CANTALLOC, FAIL, "can't free handle")
@@ -2843,7 +2841,6 @@ H5VL_deltafs_dataset_read(void *_dset, hid_t mem_type_id, hid_t mem_space_id,
     }
 
     total_time = MPI_Wtime() - start_time;
-    printf("HDF5_ReadXfer:Rank:%d, Time:%f\n", file->rank, total_time);
 done:
     if (real_file_space_id > 0 && H5Sclose(real_file_space_id ) < 0)
         HDONE_ERROR(H5E_DATASET, H5E_CANTINIT, FAIL, "can't close dataspace")
